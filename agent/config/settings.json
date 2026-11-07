@@ -1,0 +1,200 @@
+{
+    "comment": "SongForPrism 自动登录配置。用户已拍板：终点=点击 TOUCH TO START 进入游戏(click_to_start=true)、启动只用现有 .lnk(launch.mode 锁定 lnk)、允许管理员运行(提权由用户手动完成)。所有可调项集中于此，一行切换。",
+    "privileges": {
+        "require_elevation": true,
+        "note": "目标游戏进程 imasscprism 以管理员(ELEVATED)权限运行。非管理员宿主会被 Windows UIPI 静默丢弃 PostMessage/SendMessage 窗口消息，并导致 PrintWindow 等后台截图返回全黑，自动登录无法工作。故实跑前置权限自检：宿主非 ELEVATED 时输出中文提示并以非零退出码结束，不自行弹 UAC / 不自行 runas。详见 main.py 顶部说明、agent/README.md 与 ELEVATION_HINT。"
+    },
+    "launch": {
+        "mode": "lnk",
+        "lnk_path": "C:\\Users\\Anorak\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\SongForPrism.lnk",
+        "note": "launch.mode 锁定为 lnk（launch_game 只接受该值，无第二种启动方式、无 DMMGamePlayer/协议/令牌转发分支）。唯一启动入口：os.startfile(此 .lnk)。.lnk 内嵌 DMM 认证参数，由 ShellExecute 在启动前完成认证；绝不解析或复述令牌值，绝不用 subprocess.Popen 直接拉起 imasscprism.exe(会丢参数导致认证失败)。#6 实证 .lnk 短流程可用(≥210s 驻留、9~12s 到标题画面)，启动器三种调用方式全部启动即退出、拉不起游戏。",
+        "window_poll_timeout_sec": 20,
+        "window_poll_interval_sec": 2.5,
+        "window_note": "启动确认超时 20s（覆盖 surveyor 实测约 10s 的白屏→黑屏→白屏→标题画面加载），轮询间隔 2.5s（§5-4 建议 2~3s）。"
+    },
+    "window": {
+        "name_include": "imasscprism",
+        "class_name": "UnityWndClass",
+        "class_name_fallback": "",
+        "exclude_names": [
+            "iM@S SCSP Tools",
+            "WorkBuddy"
+        ],
+        "exclude_class_names": [
+            "ConsoleWindowClass",
+            "MSCTFIME UI",
+            "Default IME"
+        ],
+        "require_visible_sized": true,
+        "prealign": {
+            "enabled": true,
+            "desired_size": null,
+            "note": "★#14★ 连接 Win32Controller 之前，用 DPI-aware SetWindowPos 把窗口一次性摆进主屏工作区，使框架 ensure_window_on_screen 判 need_change=False 直接返回，切断 175% DPI 下『GetClientRect 逻辑像素 / GetWindowRect 物理像素混用 → frame 虚高 → SetWindowPos 逐次放大』的正反馈（#13 实测 48 次 2268×1328→2589×1585）。desired_size=null 表示保留当前窗口尺寸、仅按工作区裁剪（绝不放大）；需强制恢复原尺寸时填 [2268,1328]。默认仅移动(SWP_NOSIZE) 以规避 DPI-unaware 目标窗口的尺寸换算歧义；仅当当前尺寸超出工作区才 resize。"
+        },
+        "note": "最终主窗口 window_name='imasscprism'、class_name='UnityWndClass'；窗口名不含 'SongForPrism'，勿按 02-framework-notes 4.1 的示例匹配。hwnd 运行时经 Toolkit.find_desktop_windows() 动态发现(PID 每次不同，禁止硬编码)。必须排除同进程 mod 控制台 'iM@S SCSP Tools By chinosk' / ConsoleWindowClass，以及 0×0 隐藏的 MSCTFIME UI / Default IME 窗口(按类名黑名单 + IsWindowVisible/GetWindowRect 可见非 0×0 双重过滤)。"
+    },
+    "controller": {
+        "screencap": "Foreground",
+        "mouse": "Seize",
+        "keyboard": "Seize",
+        "screenshot_target_long_side": 1280,
+        "geometry_expect_height": 720,
+        "geometry_height_tolerance": 4,
+        "geometry_wait_sec": 15,
+        "note": "默认组合 = Foreground 截图(DXGI_DesktopDup_Window|ScreenDC，避开实测全黑不可用的 PrintWindow) + Seize 真实鼠标输入。★#18 输入方式一行可切（取值）★：mouse/keyboard 可填 Seize(1,默认,需窗口前台但真鼠标最可靠) / PostMessage(4,不需前台,Unity 响应未验证) / PostMessageWithCursorPos(64,不需前台+带光标位置,提权后推荐候选) / SendMessage(2) / SendMessageWithCursorPos(32)。★#18 实测结果★：上次会话窗口始终非前台(62 次 Failed to ensure foreground)，Seize 点击未生效；本轮已加 force_foreground(AttachThreadInput) 修复置前，若仍失败再由 #5 切 PostMessageWithCursorPos 验证。截图可一行改 ScreenDC/FramePool/GDI/Background。★尺寸基准改用长边 1280★：短边 720 只对 16:9 给出 1280×720，窗口比例一变宽度就跟着变；改用长边 1280 后横屏窗口模板坐标系宽度恒为 1280（16:9 仍得 1280×720），按钮 x 坐标不再漂移。geometry_wait_sec=15 为点击前的几何守卫等待上限（等截图目标收敛到 1280×720±4），超时则本轮禁用点击。"
+    },
+    "recognition": {
+        "method": "template",
+        "method_note": "template=TemplateMatch(无需外部模型，默认)；ocr=OCR(需补齐 resource/model/ocr/ 三件套，见 ocr.model_note)。",
+        "template": {
+            "files": [
+                "touch_to_start.png",
+                "touch_to_start_v2.png",
+                "touch_to_start_v3.png",
+                "touch_to_start_v4.png",
+                "touch_to_start_v5.png",
+                "touch_to_start_v6.png",
+                "touch_to_start_v7.png",
+                "touch_to_start_v8.png"
+            ],
+            "threshold": 0.5,
+            "method": 5,
+            "roi": [
+                380,
+                540,
+                520,
+                90
+            ],
+            "crop": [
+                468,
+                576,
+                793,
+                599
+            ],
+            "source_note": "★#18 用 02:10 会话(#14 修复后)真实 1280×720 帧重裁，并修正上一版两处错误★：① v1 原先裁自 02:10:20.197 帧——该帧按钮区被管理员 PowerShell 控制台遮挡（目视可见灰黑终端条），属污染模板，已换成 02:10:22.145 重裁；② 上一版写『模板不可分』是错的，因为当时的『加载态负样本』其实是亮标题帧（按钮清晰可见，见 calibration）。重裁源：7 张 02:10:2x~3x 干净标题帧 + 1 张 screencap/02:11:27.757 干净判定帧，crop=(x0,y0,x1,y1)=(468,576,793,599) → 325×23 纯文字区，避开左侧菱形装饰(404~460)与底部版权(608)。★实测可分性★：正样本 leave-one-out 最高分 min=0.676 / median=0.905（n=9 帧），真加载/过渡帧最高分 max=0.282（黑屏 0.282、白色警告页 0.000、白色公告页 0.158），合成纯白/黑/灰 = 0.000 → 取 threshold=0.5（正样本余量 +0.176，负样本余量 −0.218）。★几何★：真实 image_target 只有 1280×720（raw 2240×1260 @175%），调用 `set_screenshot_target_long_side(1280)` 后宽度恒 1280；vision 里看到的 1510/1490 是 TemplateMatcher 把模板缩略图拼在右侧（copyMakeBorder(..., templ.cols)，TemplateMatcher.cpp:143-146）造成的调试图假象，不是帧几何。模板仅用于『排除加载态后定位按钮/点击点』，**不再作为按钮消失或成功判定依据**（成功判定改为『点击后观察到加载态』，见 flow 与 README §11）。",
+            "geometry_note": "★#18 更正★：帧宽没有在 1260~1510 波动。真实 image_target 全程只有两种——1260×720（02:10:11~16，窗口刚被 prealign 改尺寸的过渡）与 1280×720（02:10:16 之后稳定，raw 2240×1260 = 1280×720@175%）。vision 目录里的 1510/1490/1627/1497 均为『image_target 宽 + 模板宽(旧230/现325)』的调试图。旧 1230(03-after-click-720p)/860 几何模板已废弃。--check [10] 为『自匹配管道自检』(喂模板母图，只证明链路跑通)；[16] 用真实帧断言定位能力。"
+        },
+        "calibration": {
+            "source_frames_visible": [
+                "vision/2026.11.07-02.10.22.145_HandleLoadingScreen_400000041.jpg",
+                "vision/2026.11.07-02.10.23.149_HandleLoadingScreen_400000043.jpg",
+                "vision/2026.11.07-02.10.24.154_HandleLoadingScreen_400000045.jpg",
+                "vision/2026.11.07-02.10.25.244_HandleLoadingScreen_400000047.jpg",
+                "vision/2026.11.07-02.10.31.233_HandleLoadingScreen_400000059.jpg",
+                "vision/2026.11.07-02.10.32.268_HandleLoadingScreen_400000061.jpg",
+                "vision/2026.11.07-02.10.33.258_HandleLoadingScreen_400000063.jpg",
+                "screencap/2026.11.07-02.11.27.757_InGameSuccess.png",
+                "on_error/2026.11.07-02.10.50.733_LoginAndStart.png",
+                "vision/2026.11.07-02.11.05.315_HandleLoadingScreen_400000124.jpg"
+            ],
+            "source_frames_loading": [
+                "vision/2026.11.07-02.10.16.166_HandleLoadingScreen_400000021.jpg",
+                "vision/2026.11.07-02.10.18.652_HandleLoadingScreen_400000031.jpg",
+                "vision/2026.11.07-02.10.17.163_HandleLoadingScreen_400000025.jpg"
+            ],
+            "visible_hit": "正样本(1280×720，按钮目视确认可见) 最高 NCC(8模板取最大)：leave-one-out min=0.676 / median=0.905 / max=0.966；含自匹配时可达 1.000（源帧自身）",
+            "visible_ncc_min": 0.676,
+            "negative_ncc_max": 0.282,
+            "visible_box": "Rect(468,576,325,23)",
+            "loading_false_hit": "真加载/过渡帧最高 NCC：黑屏(mean 2.8/std 16.0)=0.282、白色警告页(mean 251.5/std 22.1)=0.000、白色公告页(mean 246.9/std 32.0)=0.158；合成纯白/纯黑/纯灰=0.000 → 与正样本 0.676 完全可分，阈值 0.5 两侧均有余量",
+            "mislabeled_loading_note": "★上一版校准错误更正★ 旧的 source_frames_loading 三个帧(02.10.17.163 / 02.11.05.315 / 02.10.45.664)其实都是【亮标题帧】——目视 02.11.05.315 是白到发光的标题画面、TOUCH TO START 清晰可见(NCC 0.653 命中)，02.10.45.664 同理。它们被当成『白屏加载负样本』得出『白屏最高 0.757 > 标题最低 0.375、模板不可分』的结论，该结论作废。真正后果是另一个 P0：旧 is_loading_frame 用『mean>220 即加载』会把亮标题帧判成加载态，导致 HandleLoadingScreen 抢走节点、亮场期间永远不会点按钮——已用 white_std_max=12 修正。",
+            "single_template_control": "见 artifacts/18-click-fix.md 的 9×8 NCC 矩阵与 leave-one-out 统计",
+            "report": "artifacts/18-click-fix.md"
+        },
+        "loading_template": {
+            "file": "loading_now.png",
+            "threshold": 0.6,
+            "roi": [
+                860,
+                630,
+                340,
+                90
+            ],
+            "source": "artifacts/20-loading-user.png（用户提供的真实加载页，实际 2246×1254）→ 归一化 1280×720（artifacts/20-loading-1280.png）→ crop=(895,657,1150,696) 255×39",
+            "note": "★#21 新增，必须与统计判据并用★ 用户实测的加载页是**淡蓝渐变背景 + 右下角 Now Loading...**（归一化到 1280×720 后 mean≈237/std≈25），旧的 黑/纯白/低方差 判据全部 miss（实测 18 次 LoadingScreenReco ret=false）→ 必须靠模板。实现：半分辨率灰度 NCC（numpy，无 OpenCV），roi 内滑窗取最大；单次 ~30ms，可 1Hz。实测分离度：真实加载页 0.872，标题帧 ≤0.270（02.10.22.145 0.270 / 02.11.27.757 0.259 / 亮标题 0.176）、真黑屏 0.167、白色警告页 0.000 → 阈值 0.6 两侧余量 +0.27/−0.33。**局限（如实说明）**：只有用户这一张加载页素材，跨场景/跨加载页的泛化未验证；若实跑出现漏判，按 debug 留图重裁或用多模板数组。",
+            "note_scale": "用户原图 2246×1254（比例 1.791）与运行时 1280×720（1.778）略差 0.7%，按宽高分别缩放到 1280×720 后裁模板；模板只在运行时几何 1280×720±2 生效，其它尺寸自动跳过模板判据（交给统计判据）。"
+        },
+        "loading_frame": {
+            "black_mean_max": 45,
+            "white_mean_min": 220,
+            "white_std_max": 12,
+            "std_min": 8,
+            "note": "★加载态排除（第5项补正 + #18 修正）★ 自定义识别 LoadingScreenReco 判定：黑屏(mean<45) / 纯白屏(mean>220 且 std<12) / 低信息量纯色(std<8) 任一即加载态，命中后 [JumpBack]HandleLoadingScreen 回跳等待。★#18 为何必须给白屏加 std<12★：实测 02.11.05.315 是白到发光的标题帧(mean=239.7/std=23.1，TOUCH TO START 可见、NCC 0.653)，旧规则仅凭 mean>220 判它加载 → 节点被抢走、亮场期间永不点按钮；真白屏纯色 std≈0~5，白色警告页 std=22、公告页 std=32，取 12 可分离。黑屏不加方差约束：真黑屏过渡帧实测 mean=2.8/std=16.0。校准：标题画面 mean=134/std=73；灰屏 128/0；纯黑 5/0；纯白 250/0。"
+        },
+        "ocr": {
+            "expected": "TOUCH TO START",
+            "threshold": 0.3,
+            "model_note": "★重要★：MaaFramework 的 post_bundle 遇到『存在但缺三件套的 resource/model/ocr/ 目录』会整体失败(OCRResMgr::lazy_load 报 model file not found)。故本阶段默认 template 方式下【不要创建 resource/model/ocr/ 目录】，仅保留 resource/model/.gitkeep。启用 OCR 前，需先创建 resource/model/ocr/ 并放入 MaaCommonAssets 的 det.onnx + rec.onnx + keys.txt 三件套，再把 method 改为 ocr；否则 bundle 加载失败、实跑直接 FAIL_RESOURCE。此约束由 --check [14]（真实 bundle post_bundle 成功）与 [5]（空 OCR 目录检查）断言守护。"
+        },
+        "in_game_marker_template": [
+            "home_nav_bottom_right.png",
+            "home_lb_diamond.png",
+            "home_top_right_icons.png"
+        ],
+        "in_game_marker_threshold": [
+            0.55,
+            0.75,
+            0.6
+        ],
+        "in_game_marker_roi": [
+            [
+                1040,
+                570,
+                240,
+                150
+            ],
+            [
+                0,
+                0,
+                140,
+                100
+            ],
+            [
+                910,
+                0,
+                370,
+                110
+            ]
+        ],
+        "in_game_marker_note": "★#22 已接通 OK_MARKER 正向判定★ 三个模板 = 主界面三类常驻 UI（右下导航栏 Live 按钮 / 左上 LB 字样 / 右上四图标），任一在各自 roi 内命中即 OK_MARKER(exit 0)。★来源与坐标（一律 1280×720）★ 模板母图 = `debug/screencap/in_game_probe_2026.11.07-10.50.00.294_unverified.png`（确认为主界面），交叉比对帧 = 10.38.30.934_unverified.png（主界面）+ 手动截图 `artifacts/屏幕截图 2026-11-07 103935.png`（2250×1256，按宽高分别归一化到 1280×720 得 artifacts/22-manual-1280.png）；4 张标题/污染帧与加载页作负样本。crop(x0,y0,x1,y1)：nav=(1080,590,1278,720) 198×130；lb=(10,5,90,60) 80×55；topright=(950,5,1278,72) 328×67。三帧在 UI 区逐像素一致（d12=0.00），手动归一化帧仅重采样/0.7% 拉伸失真。★阈值依据（半分辨率灰度 NCC，与 match_loading_template 同算法，脚本 artifacts/22-ncc.py 可复现）★ 正样本=3 张主界面帧，负样本=10 张标题/污染帧 + 加载页 + 合成纯黑/白/灰。nav 正 1.000/1.000/0.723、负 max 0.339 → 0.55（余量 +0.17/−0.21）；lb 正 0.964/0.964/0.955、负 max 0.559 → 0.75（+0.21/−0.19）；topright 正 0.952/0.952/0.962、负 max 0.261 → 0.60（+0.35/−0.34）。三模板负样本上界差异大，故用**每模板各自阈值/roi**（数组一一对应），不沿用未校准的单一 0.7。★守护★ marker 为 null / 空数组 / 任一文件缺失 → build_marker_params 返回 None，make_marker_hit_fn 返回 None，绝不判 OK_MARKER、绝不回退裸 inverse；加载态帧不参与 marker 判定。pipeline 的 InGameSuccess 仍保持 inverse=true+按钮模板（只作『离开标题』前置信号），三态文案与退出码 0/2/3 不变。★禁用实时内容★ 头像/数值(20-20、16,440)/SALE 倒计时/活动横幅/角色立绘/对话框/左下玩家条一律不作模板。★#25 严禁下调阈值★ 真实 MaaFW 判定器实测标题帧对 home_lb_diamond 的 score=0.507051（汉堡菜单☰ 与 LB 字形相似），任何阈值 ≤0.507 会把标题帧误命中 → OK_MARKER 假成功；故 build_marker_params 强制阈值下限 0.55、且多模板时阈值数组长度须与模板数相等（否则 WARN 并禁用正向判定，绝不静默接受）。后续补裁模板/重校准只可维持或上调阈值，严禁为迁就某帧命中而下调。",
+        "stable_elements_720p": {
+            "TOUCH_TO_START_1230_historical": [
+                500,
+                578,
+                230,
+                30
+            ],
+            "note": "★历史值，勿用★：1230×720 时代的按钮框 (500,578,230,30)。#18 已实测当前几何为 1280×720、按钮框 (468,576,325,23)、roi [380,540,520,90]，一切以 recognition.template 的 crop/roi 为准。旧 860×720 裁剪窗口帧的坐标也已删除，避免误导。"
+        }
+    },
+    "flow": {
+        "click_to_start": true,
+        "max_clicks": 2,
+        "click_note": "用户已拍板：终点=点击标题画面的 TOUCH TO START 进入游戏。★#18★ 点击改用自定义动作 ClickCenter：精确点识别框中心(避免 target:true 的 rand_point 正态随机落框沿，Actuator.cpp:145-176)，不注入任何绝对坐标 Region。★#18★ 受控重试：单次 run() 内最多点击 max_clicks=2 次(首次 + 若未观察到加载态允许再点 1 次)，达上限后禁用点击，不无限重试。★提醒 #5★ 实跑必须用户手动在管理员终端执行；点击前会 force_foreground(AttachThreadInput+SetForegroundWindow 并校验 GetForegroundWindow==hwnd)。",
+        "title_wait_timeout_ms": 30000,
+        "post_click_timeout_ms": 60000,
+        "post_click_timeout_note": "点击后加载态可能比启动期更长（surveyor 实测启动约 10s 过渡，点击后加载或更久），故点击后等待给 60s；加载态由 [JumpBack]HandleLoadingScreen 优先回跳处理，Python 侧连续稳定复检另有 90s 上限。",
+        "wait_freezes_removed_note": "★轮播★ 已移除全图 pre/post_wait_freezes（原 500/300ms）：标题画面背景角色立绘持续轮播(surveyor 实测 stat 91~162、diff 37~76)，全图差分等静止会让节点超时或误判。画面稳定改由 Python 侧 confirm_not_loading_stable() 用『加载态统计 + 进程存活』的连续 7s 复检实现，不做全图差分、容忍背景轮播。build_pipeline_override 不再注入 wait_freezes，login.json 两节点也不含该字段。",
+        "rate_limit_ms": 1000,
+        "overall_timeout_sec": 300,
+        "process_check_interval_sec": 2.5,
+        "stable_alive_sec": 60,
+        "restart_wait_sec": 12,
+        "max_restarts": 2,
+        "start_rate_window_sec": 600,
+        "max_starts_per_window": 3,
+        "in_game_stable_sec": 7,
+        "stable_check_interval_sec": 0.8,
+        "stable_confirm_timeout_sec": 90,
+        "in_game_verify_sec": 30,
+        "in_game_verify_max_sec": 90,
+        "in_game_absent_sec": 20,
+        "in_game_absent_after_loading_sec": 5,
+        "verify_sample_interval_sec": 1.0,
+        "post_click_grace_sec": 3.0,
+        "verify_note": "★#21★ 点击后判定窗口：每 1s 采样一帧，先给 30s（in_game_verify_sec）；若窗口到期**画面仍在加载页**则每次延长 30s，最多到 90s（in_game_verify_max_sec，实测加载页可持续数秒~数十秒）。判据：① 命中主界面模板 → OK_MARKER；② 按钮连续 20s（in_game_absent_sec）不可见且当前非加载态 → OK_DEGRADED_UNVERIFIED（仅疑似）；③ 窗口内按钮仍反复可见 → NOT_CONFIRMED；④ 点击后进程/窗口消失（实测点击后客户端会重启）→ 重连，不计判定失败。★若 pipeline 已观察到加载页（loading_seen_after_click=True）说明确实离开了标题，缺席门槛降到 5s（in_game_absent_after_loading_sec）★。post_click_grace_sec=3 用于忽略点击后头 3s 的残留帧（实测点击后 2~6s 内 InGameSuccess 的裸 inverse 就会命中，而那只是标题淡出/立绘轮播：10:26:11、10:28:18 的 screencap 仍是标题 LOGO）。",
+        "note": "★兜底参数按 artifacts/06-diagnosis.md §5 第4条校准★ 轮询 2~3s(process_check_interval_sec=2.5)；启动确认超时 20s(window_poll_timeout_sec=20)；窗口连续存活 ≥60s(stable_alive_sec)判定『本次启动可用』——此口径仅用于重启决策/确定性失败标注的观测，★不作为登录前置等待、不是长期保活★；进程消失后等 10~15s(restart_wait_sec=12，等 conhost/UnityCrashHandler64 子进程退出、句柄释放)再重启；最多重启 2 次(max_restarts=2，合计最多 3 次启动)；5~10 分钟内不超过 3 次启动(start_rate_window_sec=600 / max_starts_per_window=3，避免触发 GameGuard 风控)；第 3 次仍在相同时间窗退出 → 判定确定性失败(FAIL_DETERMINISTIC)、停止重试并上报，不无限循环。★重要★：自退时长不固定、实测约 3~6 分钟，形态是静默主动退出非崩溃；进程存活检测必要，但有限重启只保证『至少一次成功启动并完成短动作』，对长期驻留无意义，不要写成长期保活逻辑；每次 os.startfile(<lnk>) 携带同一份静态令牌、不刷新，必然再次自退——绝对不要写任何令牌刷新逻辑。短流程优先：9~12s 到标题画面，尽快完成识别与点击，不以长期驻留为成功前提。",
+        "degraded_note": "★三态判定（#21 定稿）★ ① OK_MARKER：主界面模板命中 → 确认进入（退出码 0）。② OK_DEGRADED_UNVERIFIED：点击成功 + 按钮连续 20s 不可见 + 非加载态 + 进程存活，但**没有**正向标志 → 仅『疑似成功』，日志用 WARN 明确标注『未经正向标志确认』，退出码 **3**（既不是 0 也不是普通失败 2）。③ NOT_CONFIRMED：点击未成功或仍停在标题 → 退出码 2。**裸 inverse 单帧命中永不作为成功依据**（实测 10:26:11/10:28:18 判定帧仍是标题 LOGO）。",
+        "stability_note": "★过渡态误判规避(★#21 更新★)★ 点击后游戏进入加载/淡出，按钮会消失，裸 inverse 会立即误报成功。防线：① pipeline 的 [JumpBack]HandleLoadingScreen 放在 WaitInGame.next 第一位，LoadingScreenReco 覆盖 黑(mean<45)/纯白(mean>220 且 std<12)/低方差(std<8)；② 不用全图 pre/post_wait_freezes(立绘轮播干扰，已移除)；③ Python 侧 post_click_verify 点击后持续采样 30s，只有『主界面模板命中(OK_MARKER)』或『按钮连续 20s 不见且非加载态(OK_DEGRADED_UNVERIFIED，仅疑似)』才出结论，单帧按钮缺失一律不算；④ 判定时刻原图存 debug/screencap/in_game_probe_*.png 便于事后复核与裁模板。详见 agent/README.md §5/§11。"
+    }
+}

@@ -1,0 +1,9 @@
+[错误] 未找到可用的 maafw（Python 包，import 名为 maa）。
+       你当前终端的 python 与装有 maafw 的解释器不是同一个。
+
+   请在需要运行本脚本的 Python 环境里安装（必须带官方源，本机清华镜像无此包）：
+       python -m pip install maafw -i https://pypi.org/simple
+
+   推荐长期方案：装进 conda base（见 README「如何启动」）：
+       conda activate base
+       python -m pip install maafw -i https://pypi.org/simple

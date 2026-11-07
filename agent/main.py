@@ -1,0 +1,2774 @@
+"""SongForPrism 自动登录（MaaFramework / Win32 集成）。
+
+流程：权限自检 → 经 .lnk 启动游戏 → 20s 启动确认/2.5s 轮询动态发现主窗口 → Win32Controller 连接
+     → 加载 resource/ Bundle → 运行 pipeline(识别 TOUCH TO START → 点击 → 判定)
+     → ★#21★ 点击后持续采样 20~30s（仍在加载页可延到 90s），三态判定（互斥、退出码分明）：
+       ① OK_MARKER              正向主界面模板命中 → 终端「结果: 成功（已确认进入主界面）」，退出码 0
+       ② OK_DEGRADED_UNVERIFIED 按钮连续 20s 不见 + 非加载态 + 进程存活，但无正向标志
+                                → 终端「结果: 疑似成功（已离开标题并进入加载/游戏，但未确认主界面）」，
+                                  退出码 3；**这不是失败，是待确认**，并打印留图路径供补模板
+       ③ NOT_CONFIRMED          点击未成功或仍停在标题 → 「结果: 失败（未离开标题画面）」，退出码 2
+       裸 inverse「按钮消失」**不作**成功依据（实测标题轮播/淡出会让它反复误命中）。
+       判定时刻的原图一律存 debug/screencap/in_game_probe_*.png 供下次裁主界面模板。
+       详见 agent/README.md §5/§12 与 artifacts/21-ingame-verify.md。
+
+认证由 .lnk 内嵌的 DMM 参数在启动前完成；全程不需要账号/密码/验证码，本文件也绝不
+读取或记录 .lnk 内嵌的 pf_access_token 等令牌值，只保存 .lnk 的路径。
+
+────────────────────────────────────────────────────────────────────────────
+【为什么必须「管理员权限」运行】
+目标游戏进程 imasscprism 是 ELEVATED(管理员)，宿主 WorkBuddy 非管理员。Windows UIPI
+会静默丢弃 PostMessage/SendMessage 窗口消息，并使 PrintWindow 后台截图返回全黑，识别与
+点击都会失效。因此脚本开头做权限自检：宿主非管理员时输出中文提示(ELEVATION_HINT)并以
+明确非零退出码结束；不静默降级、不自行弹 UAC、不自行调用 runas / ShellExecute("runas")，
+提权由用户手动完成(以管理员身份打开终端后执行 python agent/main.py)。
+
+【两种输入 / 截图方案的切换方法】(均在 config/settings.json 的 controller 段，一行切换)
+  · 默认(实测推荐): screencap="Foreground"(避开 PrintWindow 全黑) + mouse/keyboard="Seize"
+    (真实鼠标，不受 UIPI 限制，对 Unity 最可靠)。
+  · 提权后若不希望抢鼠标: 把 mouse/keyboard 改成 "PostMessage" / "SendMessage" /
+    "PostMessageWithCursorPos" 等消息式输入；但 Unity 对消息式点击的响应未经验证，
+    若点击无效请改回 "Seize"。
+  · 截图备选: "ScreenDC" / "FramePool" / "GDI" / "Background"；若某个方式黑屏或失败，
+    改这一行即可。实跑由任务 #5 按效果决定，勿写死。
+────────────────────────────────────────────────────────────────────────────
+
+用法：
+  python main.py --check        # 静态自测：不启动游戏、不点击真实窗口、不创建 Win32 控制器
+  python main.py                # 实跑(需管理员；由任务 #5 承担，本阶段不执行)
+  python main.py --skip-launch  # 跳过启动，仅附加到已存在窗口(供联调)
+
+待定开关(用户已拍板)：flow.click_to_start=true(点击 TOUCH TO START 进入游戏)。
+启动只用现有 .lnk(launch_game 单一函数，无第二种启动方式)。
+"""
+from __future__ import annotations
+
+import argparse
+import ctypes
+import inspect
+import json
+import os
+import struct
+import sys
+import time
+from ctypes import wintypes
+from pathlib import Path
+
+from maa.library import Library
+from maa.toolkit import Toolkit
+from maa.resource import Resource
+from maa.controller import (
+    Win32Controller,
+    MaaWin32ScreencapMethodEnum,
+    MaaWin32InputMethodEnum,
+)
+from maa.tasker import Tasker
+from maa.context import Context, ContextEventSink
+from maa.event_sink import NotificationType
+from maa.custom_recognition import CustomRecognition
+from maa.custom_action import CustomAction
+from maa.define import LoggingLevelEnum
+from maa.pipeline import JRecognitionType, JTemplateMatch
+
+BASE_DIR = Path(__file__).resolve().parent
+CONFIG_FILE = BASE_DIR / "config" / "settings.json"
+RESOURCE_DIR = BASE_DIR / "resource"
+DEBUG_DIR = BASE_DIR / "debug"
+IMAGE_DIR = RESOURCE_DIR / "image"
+PIPELINE_DIR = RESOURCE_DIR / "pipeline"
+AGENT_LOG = DEBUG_DIR / "agent.log"
+ARTIFACTS_DIR = (BASE_DIR.parent / ".workbuddy" / "artifacts")
+
+# tools/ 下的纯 Python PNG 工具（静态自测「自匹配管道自检」时按需 import）
+_TOOLS_DIR = str(BASE_DIR / "tools")
+if _TOOLS_DIR not in sys.path:
+    sys.path.insert(0, _TOOLS_DIR)
+
+CUSTOM_RECO_NAME = "LoadingScreenReco"
+
+# 结果码（★#21★ 三态判定，互斥且语义固定）
+OK_MARKER = "OK_MARKER"              # ① 正向主界面模板命中 → 确认进入游戏
+OK_DEGRADED_UNVERIFIED = "OK_DEGRADED_UNVERIFIED"  # ② 疑似成功：点击成功+按钮消失+非加载+进程存活，
+                                     #    但无正向标志（未经确认，退出码 3，日志显式标注）
+FAIL_NOT_CONFIRMED = "NOT_CONFIRMED"  # ③ 点击未成功或仍停在标题（真失败）
+FAIL_NOT_ELEVATED = "NOT_ELEVATED"
+FAIL_LAUNCH = "LAUNCH_FAILED"
+FAIL_WINDOW_NOT_FOUND = "WINDOW_NOT_FOUND"
+FAIL_CONNECT = "CONNECT_FAILED"
+FAIL_RESOURCE = "RESOURCE_LOAD_FAILED"
+FAIL_PROCESS_DIED = "GAME_PROCESS_DIED"
+FAIL_OVERALL_TIMEOUT = "OVERALL_TIMEOUT"
+FAIL_MAX_RESTARTS = "MAX_RESTARTS_EXCEEDED"
+FAIL_DETERMINISTIC = "DETERMINISTIC_FAILURE"  # 第3次同窗退出，停止重试并上报
+FAIL_STABLE_TIMEOUT = "STABLE_CONFIRM_TIMEOUT"  # 点击后加载态迟迟不结束，稳定复检超时
+FAIL_NOT_CONFIRMED = "NOT_CONFIRMED"  # ★#18★ 未观察到加载态、也无正向主界面标志 → 不得判成功
+
+ELEVATION_HINT = (
+    "============================================================\n"
+    " 权限不足：必须以管理员身份运行本脚本\n"
+    "============================================================\n"
+    "原因：目标游戏进程 imasscprism 以管理员(ELEVATED)权限运行，而当前宿主进程非管理员。\n"
+    "      Windows UIPI 会静默丢弃 PostMessage/SendMessage 窗口消息，并使 PrintWindow 等\n"
+    "      后台截图返回全黑，导致界面识别与点击失效，自动登录无法工作。\n"
+    "解决：请【手动】以管理员身份运行，本脚本不会自行弹 UAC、不会自行调用 runas 提权：\n"
+    "      1) 右键「Windows 终端 / PowerShell / CMD」→ 以管理员身份运行；\n"
+    "      2) 执行： cd /d D:\\DMM\\scsp_MAA   然后   python agent\\main.py\n"
+    "      3) 静态自测可在非管理员下运行： python agent\\main.py --check\n"
+)
+
+
+# --------------------------------------------------------------------------- #
+# 日志（自有日志 debug/agent.log；框架日志 debug/maafw.log 由 init_option 生成）
+# --------------------------------------------------------------------------- #
+def log(msg: str, level: str = "INFO") -> None:
+    line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}][{level}] {msg}"
+    print(line, flush=True)
+    try:
+        DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+        with AGENT_LOG.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+
+
+def load_settings() -> dict:
+    with CONFIG_FILE.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+# --------------------------------------------------------------------------- #
+# 权限自检（不自行提权）
+# --------------------------------------------------------------------------- #
+_advapi32 = ctypes.windll.advapi32
+_advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+_advapi32.OpenProcessToken.restype = wintypes.BOOL
+_advapi32.GetTokenInformation.argtypes = [
+    wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)
+]
+_advapi32.GetTokenInformation.restype = wintypes.BOOL
+TOKEN_QUERY = 0x0008
+TOKEN_ELEVATION = 20  # TokenElevation 信息类
+
+
+def is_self_elevated() -> bool:
+    """宿主进程是否管理员（IsUserAnAdmin）。"""
+    try:
+        ctypes.windll.shell32.IsUserAnAdmin.restype = wintypes.BOOL
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def is_process_elevated(pid: int):
+    """目标进程是否管理员；无法判断返回 None（token query）。"""
+    h = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+    if not h:
+        return None
+    try:
+        tok = wintypes.HANDLE()
+        if not _advapi32.OpenProcessToken(h, TOKEN_QUERY, ctypes.byref(tok)):
+            return None
+        try:
+            elev = wintypes.DWORD()
+            length = wintypes.DWORD()
+            ok = _advapi32.GetTokenInformation(
+                tok, TOKEN_ELEVATION, ctypes.byref(elev), ctypes.sizeof(elev), ctypes.byref(length)
+            )
+            return bool(elev.value) if ok else None
+        finally:
+            ctypes.windll.kernel32.CloseHandle(tok)
+    finally:
+        ctypes.windll.kernel32.CloseHandle(h)
+
+
+def require_elevation(cfg: dict) -> bool:
+    """实跑前置：宿主非 ELEVATED → 打印中文提示 + 返回 False（由 run 以明确失败码结束）。"""
+    if not cfg["privileges"]["require_elevation"]:
+        return True
+    if is_self_elevated():
+        log("权限自检：宿主已 ELEVATED ✓")
+        return True
+    print(ELEVATION_HINT)
+    log("权限自检失败：宿主非 ELEVATED；按规格输出提示并以非零退出码结束（不自行提权）", "ERROR")
+    return False
+
+
+# --------------------------------------------------------------------------- #
+# 全局日志 / 调试开关
+# --------------------------------------------------------------------------- #
+def init_framework_logging() -> bool:
+    (BASE_DIR / "config").mkdir(parents=True, exist_ok=True)
+    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+    default_config = {
+        "logging": True,          # debug/maafw.log 保留全量
+        "save_draw": True,        # debug/vision 识别可视化
+        "save_on_error": True,    # debug/on_error 失败留图
+        "stdout_level": 4,        # 控制台只显示 Info 及以上，避免 TRACE 刷屏
+        "draw_quality": 85,
+    }
+    ok = Toolkit.init_option(str(BASE_DIR), default_config)
+    Tasker.set_log_dir(str(DEBUG_DIR))
+    Tasker.set_save_draw(True)
+    Tasker.set_save_on_error(True)
+    Tasker.set_stdout_level(LoggingLevelEnum.Info)
+    Tasker.set_draw_quality(85)
+    return bool(ok)
+
+
+def resolve_controller_methods(cfg: dict) -> tuple[int, int, int]:
+    c = cfg["controller"]
+    try:
+        screencap = int(getattr(MaaWin32ScreencapMethodEnum, c["screencap"]))
+        mouse = int(getattr(MaaWin32InputMethodEnum, c["mouse"]))
+        keyboard = int(getattr(MaaWin32InputMethodEnum, c["keyboard"]))
+    except AttributeError as exc:
+        raise ValueError(f"controller 配置含未知方式: {exc}") from exc
+    return screencap, mouse, keyboard
+
+
+# --------------------------------------------------------------------------- #
+# 加载态识别：黑屏 / 白屏 / 低信息量纯色（[JumpBack] 用，纯 numpy，无外部素材）
+# --------------------------------------------------------------------------- #
+def is_loading_frame(frame, black_mean_max=45.0, white_mean_min=220.0, std_min=8.0,
+                     white_std_max=12.0) -> bool:
+    """★第5项补正★ 判定画面是否处于加载/过渡态：黑屏、纯白屏、或低信息量纯色。
+
+    ★#18 修正（有真实帧证据）★ 白屏必须再加低方差约束：旧规则「mean>220 即加载」会把
+    『亮标题帧』判成加载态——实测 `02.11.05.315` 是白到发光的标题画面(mean=239.7/std=23.1，
+    TOUCH TO START 清晰可见，NCC 0.653 命中)，却被判加载→ HandleLoadingScreen 抢走 →
+    整个亮场期间永远不点按钮。真·白屏加载/纯色帧 std 都 <5，白色公告页 std≈22，
+    故取 white_std_max=12 作为分界（真白屏 0~5 命中；亮标题 23+ / 公告页 22 不命中）。
+    黑屏保持「mean<45」不加方差约束：实测真黑屏过渡帧 mean=2.8/std=16.0，加约束会漏判。
+    纯函数：自定义识别与 Python 侧连续稳定复检共用，便于 --check 单元测。
+    """
+    if frame is None or getattr(frame, "size", 0) == 0:
+        return True  # 无有效帧按加载态处理（保守，避免误报成功）
+    mean = float(frame.mean())
+    std = float(frame.std())
+    return (mean < black_mean_max
+            or (mean > white_mean_min and std < white_std_max)
+            or std < std_min)
+
+
+# --------------------------------------------------------------------------- #
+# ★#21★ 加载页模板判定（真实素材：淡蓝渐变背景 + 右下 "Now Loading..."）
+#   背景：用户实测的加载页既不是纯黑也不是纯白（mean≈237 / std≈40），旧三态判据全部 miss，
+#   导致 18 次 LoadingScreenReco 全部 ret=false、loading_seen_after_click 永远不置位。
+# --------------------------------------------------------------------------- #
+_LOADING_TPL_CACHE: dict = {}
+
+
+def _downsample_half(gray):
+    import numpy as np
+    h, w = gray.shape[:2]
+    h2, w2 = h // 2, w // 2
+    return gray[: h2 * 2, : w2 * 2].reshape(h2, 2, w2, 2).mean(axis=(1, 3)).astype(np.float32)
+
+
+def load_loading_template(name: str):
+    """加载并缓存「半分辨率灰度、已去均值」的加载页模板 → (模板, 范数)。文件 mtime 变更自动失效。"""
+    import numpy as np
+    from make_template import decode_image  # tools/
+    path = IMAGE_DIR / name
+    key = (str(path), int(path.stat().st_mtime))
+    cached = _LOADING_TPL_CACHE.get(key)
+    if cached is not None:
+        return cached
+    rgb = decode_image(path)[:, :, :3]
+    g = _downsample_half(rgb.mean(axis=2).astype(np.float32))
+    g -= g.mean()
+    tpl = (g, float(np.sqrt((g * g).sum())) or 1.0)
+    _LOADING_TPL_CACHE.clear()
+    _LOADING_TPL_CACHE[key] = tpl
+    return tpl
+
+
+def match_loading_template(frame, template: str, roi=(860, 630, 340, 90)) -> float:
+    """半分辨率灰度 NCC：返回 roi 内与加载页模板的最大归一化相关系数（可负，取最大）。
+
+    只在运行时几何（1280×720±2）启用；其它尺寸返回 0（模板按运行时几何裁，缩放会失真，
+    交给黑白/纯色统计判据处理）。半分辨率 + 局部 roi 使单次耗时 ~30ms，可 1Hz 调用。
+    实测（#21，`--check [17]` 复现）：真实加载页 **0.872**；标题帧 ≤0.270、真黑屏 0.167、
+    白色警告页 0.000 → 阈值 0.6 两侧余量 +0.27 / −0.33。
+    """
+    import numpy as np
+    from numpy.lib.stride_tricks import sliding_window_view as swv
+    if frame is None or getattr(frame, "size", 0) == 0:
+        return 0.0
+    arr = np.asarray(frame)
+    if arr.ndim == 3:
+        gray = arr[:, :, :3].mean(axis=2)
+    else:
+        gray = arr
+    h, w = gray.shape[:2]
+    if abs(w - 1280) > 2 or abs(h - 720) > 2:
+        return 0.0
+    tg, tden = load_loading_template(template)
+    th, tw = tg.shape
+    x, y, rw, rh = [int(v / 2) for v in roi]      # roi 按 1280×720 给出 → 半分辨率除以 2
+    g2 = _downsample_half(gray.astype(np.float32))
+    sub = g2[y:y + rh, x:x + rw]
+    if sub.shape[0] < th or sub.shape[1] < tw:
+        return 0.0
+    flat_t = tg.reshape(-1)
+    best = 0.0
+    for yy in range(sub.shape[0] - th + 1):
+        win = swv(sub[yy:yy + th], (th, tw))[0].reshape(-1, th * tw)
+        win = win - win.mean(axis=1, keepdims=True)
+        den = np.sqrt((win * win).sum(axis=1)) + 1e-6
+        best = max(best, float(((win @ flat_t) / (den * tden)).max()))
+    return best
+
+
+def detect_loading_frame(frame, *, black_mean_max=45.0, white_mean_min=220.0, std_min=8.0,
+                         white_std_max=12.0, template=None, template_threshold=0.6,
+                         template_roi=(860, 630, 340, 90)) -> tuple[bool, dict]:
+    """★#21★ 加载态**复合**判据：黑/纯白低方差/低方差纯色 **或** 命中 `Now Loading` 模板。
+
+    返回 (is_loading, info)。info 含 mean/std/stats_hit/tpl_score/reason，便于日志与自测核对。
+    """
+    stats_hit = is_loading_frame(frame, black_mean_max, white_mean_min, std_min, white_std_max)
+    info: dict = {"stats_hit": stats_hit}
+    try:
+        if frame is not None and getattr(frame, "size", 0):
+            info["mean"] = round(float(frame.mean()), 1)
+            info["std"] = round(float(frame.std()), 1)
+    except Exception:  # noqa: BLE001 - 仅日志信息
+        pass
+    if stats_hit:
+        info["reason"] = "stats(black/white/low-var)"
+        return True, info
+    if template:
+        s = match_loading_template(frame, template, tuple(template_roi))
+        info["tpl_score"] = round(s, 3)
+        if s >= float(template_threshold):
+            info["reason"] = "loading-template"
+            return True, info
+    info["reason"] = "none"
+    return False, info
+
+
+class LoadingScreenReco(CustomRecognition):
+    """加载态命中 → [JumpBack] 回跳等待，不得进入 InGameSuccess。
+
+    ★复合判据（#21）★ ① 黑屏 / 纯白低方差 / 低方差纯色（统计）**或** ② 命中 `Now Loading`
+    模板。用户提供的真实加载页是**淡蓝渐变 + 右下角 Now Loading...**（mean≈237/std≈40），
+    统计判据完全不命中（实测 18 次 ret=false），必须靠模板；两者任一命中即加载态。
+    """
+
+    def analyze(self, context: Context, argv: CustomRecognition.AnalyzeArg):
+        black, white, std_min, white_std_max = 45.0, 220.0, 8.0, 12.0
+        tpl, tpl_thr, tpl_roi = None, 0.6, (860, 630, 340, 90)
+        try:
+            param = json.loads(argv.custom_recognition_param or "{}")
+            black = float(param.get("black_mean_max", black))
+            white = float(param.get("white_mean_min", white))
+            std_min = float(param.get("std_min", std_min))
+            white_std_max = float(param.get("white_std_max", white_std_max))
+            tpl = param.get("loading_template") or None
+            tpl_thr = float(param.get("loading_template_threshold", tpl_thr))
+            roi = param.get("loading_template_roi")
+            if roi:
+                tpl_roi = tuple(int(v) for v in roi)
+        except (ValueError, TypeError, AttributeError):
+            pass
+        img = argv.image
+        hit, info = detect_loading_frame(
+            img, black_mean_max=black, white_mean_min=white, std_min=std_min,
+            white_std_max=white_std_max, template=tpl, template_threshold=tpl_thr,
+            template_roi=tpl_roi,
+        )
+        if not hit:
+            return None
+        h, w = img.shape[:2] if (img is not None and getattr(img, "size", 0)) else (0, 0)
+        return CustomRecognition.AnalyzeResult(
+            box=(0, 0, w, h),
+            detail={
+                "black_mean_max": black, "white_mean_min": white, "std_min": std_min,
+                "white_std_max": white_std_max, "loading_template": tpl,
+                "loading_template_threshold": tpl_thr, **info,
+            },
+        )
+
+
+# --------------------------------------------------------------------------- #
+# 事件回调：记录被识别到的界面标志，作为成功判定依据
+# --------------------------------------------------------------------------- #
+class ClickCenterAction(CustomAction):
+    """★#18★ 点击「识别框中心」。默认 Click 的 target:true 会用 rand_point（正态分布、可能落框沿，
+    见 Actuator.cpp:145-176）；本自定义动作精确点 box 中心。argv.box 为缩放截图坐标，
+    post_click 期望缩放坐标、框架内部再按 raw/target 还原（ControllerAgent.cpp:1226-1238）。"""
+
+    def run(self, context: Context, argv: CustomAction.RunArg):
+        box = argv.box
+        cx = int(box.x + box.w // 2)
+        cy = int(box.y + box.h // 2)
+        try:
+            job = context.tasker.controller.post_click(cx, cy)
+            job.wait()
+            ok = bool(job.succeeded)
+        except Exception as exc:  # noqa: BLE001
+            log(f"ClickCenterAction 异常: {exc}", "WARN")
+            return False
+        log(f"ClickCenterAction: 点击识别框中心 ({cx},{cy}) "
+            f"box=({box.x},{box.y},{box.w},{box.h}) {'成功' if ok else '失败'}",
+            "INFO" if ok else "WARN")
+        return ok
+
+
+class NodeEventSink(ContextEventSink):
+    def __init__(self) -> None:
+        super().__init__()
+        self.marker_node = ""
+        self.success_node = ""
+        self.succeeded_recognitions: set[str] = set()
+        self.succeeded_actions: set[str] = set()
+        self.events: list[str] = []
+        # ★#18★ 成功判定不再依赖裸 inverse：记录「是否已点击」与「点击后是否观察到加载态」
+        self.clicked = False
+        self.loading_seen_after_click = False
+        self.click_count = 0
+
+    def set_targets(self, marker_node: str, success_node: str) -> None:
+        self.marker_node = marker_node
+        self.success_node = success_node
+
+    def reset(self) -> None:
+        self.succeeded_recognitions.clear()
+        self.succeeded_actions.clear()
+        self.events.clear()
+        self.clicked = False
+        self.loading_seen_after_click = False
+
+    def on_node_recognition(self, context, noti_type, detail):
+        name = str(detail.name)
+        succeeded = noti_type == NotificationType.Succeeded
+        self.events.append(f"reco {name} type={int(noti_type)} succeeded={succeeded}")
+        if succeeded:
+            self.succeeded_recognitions.add(name)
+            # ★#18★ 点击后若命中 HandleLoadingScreen（黑/白/低方差加载态）→ 记录已观察到加载
+            if name == "HandleLoadingScreen" and self.clicked:
+                self.loading_seen_after_click = True
+        log(f"  · 识别 {name}: {'命中' if succeeded else int(noti_type)}")
+
+    def on_node_action(self, context, noti_type, detail):
+        name = str(detail.name)
+        succeeded = noti_type == NotificationType.Succeeded
+        self.events.append(f"action {name} type={int(noti_type)} succeeded={succeeded}")
+        if succeeded:
+            self.succeeded_actions.add(name)
+            if name == "TitleScreenDetectedClick":
+                self.clicked = True
+                self.click_count += 1
+        log(f"  · 动作 {name}: {'成功' if succeeded else int(noti_type)}")
+
+    def is_success(self, tasker: Tasker) -> bool:
+        """成功判定靠「识别到的界面标志」，不能只判断动作已发送。"""
+        marker_ok = self.marker_node in self.succeeded_recognitions
+        success_ok = (
+            self.success_node in self.succeeded_recognitions
+            or self.success_node in self.succeeded_actions
+            or tasker.get_latest_node(self.success_node) is not None
+        )
+        failure_seen = ("HandleFailure" in self.succeeded_recognitions
+                        or "DoStop" in self.succeeded_actions)
+        return marker_ok and success_ok and not failure_seen
+
+
+# --------------------------------------------------------------------------- #
+# 进程 / 窗口存活监控 + 窗口几何（ctypes，无第三方依赖）
+# --------------------------------------------------------------------------- #
+_user32 = ctypes.windll.user32
+_kernel32 = ctypes.windll.kernel32
+_user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+_user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+_user32.IsWindow.argtypes = [wintypes.HWND]
+_user32.IsWindow.restype = wintypes.BOOL
+_user32.IsWindowVisible.argtypes = [wintypes.HWND]
+_user32.IsWindowVisible.restype = wintypes.BOOL
+_kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+_kernel32.OpenProcess.restype = wintypes.HANDLE
+_kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+_kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+_kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+_kernel32.CloseHandle.restype = wintypes.BOOL
+
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+STILL_ACTIVE = 259
+
+
+class _RECT(ctypes.Structure):
+    _fields_ = [("L", wintypes.LONG), ("T", wintypes.LONG),
+                ("R", wintypes.LONG), ("B", wintypes.LONG)]
+
+
+_user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(_RECT)]
+_user32.GetWindowRect.restype = wintypes.BOOL
+
+
+# --------------------------------------------------------------------------- #
+# ★#14★ 窗口预调整所需的 Win32 结构 / 常量 / API（连接前把窗口摆进工作区，
+# 切断 175% DPI 下框架 ensure_window_on_screen 的正反馈放大）
+# --------------------------------------------------------------------------- #
+class _MONITORINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.DWORD),
+                ("rcMonitor", _RECT),
+                ("rcWork", _RECT),
+                ("dwFlags", wintypes.DWORD)]
+
+
+MONITOR_DEFAULTTONEAREST = 2
+SWP_NOSIZE = 0x0001
+SWP_NOZORDER = 0x0004
+SWP_NOACTIVATE = 0x0010
+SWP_NOOWNERZORDER = 0x0200
+
+_user32.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+_user32.MonitorFromWindow.restype = wintypes.HANDLE
+_user32.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_MONITORINFO)]
+_user32.GetMonitorInfoW.restype = wintypes.BOOL
+_user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND,
+                                 ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                 wintypes.UINT]
+_user32.SetWindowPos.restype = wintypes.BOOL
+
+
+def _hwnd_int(hwnd) -> int:
+    if isinstance(hwnd, int):
+        return hwnd
+    val = getattr(hwnd, "value", None)
+    return int(val) if val is not None else int(hwnd)
+
+
+def window_usable(hwnd) -> bool:
+    """排除 0×0 隐藏的 IME 窗口：必须可见且宽高 > 0。"""
+    h = _hwnd_int(hwnd)
+    if not _user32.IsWindowVisible(wintypes.HWND(h)):
+        return False
+    r = _RECT()
+    if not _user32.GetWindowRect(wintypes.HWND(h), ctypes.byref(r)):
+        return False
+    return (r.R - r.L) > 0 and (r.B - r.T) > 0
+
+
+def init_dpi_awareness() -> str:
+    """★#14★ 让本进程成为 Per-Monitor DPI aware，使 GetWindowRect/SetWindowPos 用物理像素。
+
+    175% 缩放下若本进程 DPI-unaware，窗口坐标会被二次虚拟化，预调整的尺寸/位置会算错
+    （框架 ensure_window_on_screen 正是因逻辑/物理混用 + 目标窗口 DPI-unaware 才正反馈放大）。
+    失败不致命（可能已由 manifest/宿主设过），返回实际生效模式或 unchanged。
+    """
+    try:
+        fn = getattr(_user32, "SetProcessDpiAwarenessContext", None)
+        if fn is not None:
+            fn.argtypes = [ctypes.c_void_p]
+            fn.restype = wintypes.BOOL
+            # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
+            if fn(ctypes.c_void_p(-4)):
+                return "PerMonitorV2"
+    except Exception:
+        pass
+    try:
+        fn2 = getattr(ctypes.windll.shcore, "SetProcessDpiAwareness", None)
+        if fn2 is not None:
+            fn2.argtypes = [ctypes.c_int]
+            fn2.restype = ctypes.c_long
+            if fn2(2) == 0:  # PROCESS_PER_MONITOR_DPI_AWARE
+                return "PerMonitor"
+    except Exception:
+        pass
+    try:
+        if _user32.SetProcessDPIAware():
+            return "SystemAware"
+    except Exception:
+        pass
+    return "unchanged(already-set-or-failed)"
+
+
+def compute_prealign_rect(mon_work, cur_rect, desired_size=None):
+    """★纯函数★ 计算把窗口摆进工作区的目标窗口矩形 (x, y, w, h)，不触碰任何 HWND，便于单测。
+
+    mon_work: (left, top, right, bottom) 显示器工作区（物理像素，rcWork）
+    cur_rect: (x, y, w, h) 当前窗口矩形（物理像素）
+    desired_size: (w, h) 期望尺寸；None = 保留当前尺寸（仅按工作区上限裁剪，绝不放大）
+    规则：尺寸取 min(期望或当前, 工作区尺寸)；位置先保右/下不越界，再保左/上不越界（与框架同序）。
+    """
+    ml, mt, mr, mb = mon_work
+    work_w = mr - ml
+    work_h = mb - mt
+    cx, cy, cw, ch = cur_rect
+    dw, dh = desired_size if desired_size else (cw, ch)
+    w = max(1, min(int(dw), max(1, work_w)))
+    h = max(1, min(int(dh), max(1, work_h)))
+    x, y = int(cx), int(cy)
+    if x + w > mr:
+        x = mr - w
+    if y + h > mb:
+        y = mb - h
+    if x < ml:
+        x = ml
+    if y < mt:
+        y = mt
+    return (x, y, w, h)
+
+
+def get_window_rect_px(hwnd):
+    """读取窗口矩形 (x,y,w,h) 物理像素；失败返回 None。"""
+    r = _RECT()
+    if not _user32.GetWindowRect(wintypes.HWND(_hwnd_int(hwnd)), ctypes.byref(r)):
+        return None
+    return (r.L, r.T, r.R - r.L, r.B - r.T)
+
+
+def get_monitor_work_rect(hwnd):
+    """取窗口所在显示器工作区 (l,t,r,b) 物理像素；失败返回 None。"""
+    hmon = _user32.MonitorFromWindow(wintypes.HWND(_hwnd_int(hwnd)), MONITOR_DEFAULTTONEAREST)
+    if not hmon:
+        return None
+    mi = _MONITORINFO()
+    mi.cbSize = ctypes.sizeof(_MONITORINFO)
+    if not _user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+        return None
+    return (mi.rcWork.L, mi.rcWork.T, mi.rcWork.R, mi.rcWork.B)
+
+
+def set_window_pos(hwnd, x, y, cx, cy, flags) -> bool:
+    return bool(_user32.SetWindowPos(wintypes.HWND(_hwnd_int(hwnd)), None,
+                                     int(x), int(y), int(cx), int(cy), int(flags)))
+
+
+_user32.GetForegroundWindow.restype = wintypes.HWND
+_user32.BringWindowToTop.argtypes = [wintypes.HWND]
+_user32.BringWindowToTop.restype = wintypes.BOOL
+_user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+_user32.SetForegroundWindow.restype = wintypes.BOOL
+_user32.SetFocus.argtypes = [wintypes.HWND]
+_user32.SetFocus.restype = wintypes.HWND
+_user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+_user32.AttachThreadInput.restype = wintypes.BOOL
+_kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+
+
+def force_foreground(hwnd) -> bool:
+    """★#18★ 可靠置前：AttachThreadInput(前台线程, 本线程) + BringWindowToTop + SetForegroundWindow，
+    然后校验 GetForegroundWindow()==hwnd 并记日志。裸 SetForegroundWindow 会被前台锁拒绝。
+    不自行提权、不弹 UAC（仅窗口 Z 序/焦点操作）。"""
+    h = _hwnd_int(hwnd)
+    hwnd_w = wintypes.HWND(h)
+    if not _user32.IsWindow(hwnd_w):
+        log("force_foreground: 窗口无效", "WARN")
+        return False
+    fg = _user32.GetForegroundWindow()
+    if fg and _hwnd_int(fg) == h:
+        log(f"force_foreground: 目标 hwnd={h} 已是前台，无需切换（GetForegroundWindow 校验通过）")
+        return True
+    fg_tid = 0
+    if fg:
+        pid_tmp = wintypes.DWORD(0)
+        fg_tid = int(_user32.GetWindowThreadProcessId(fg, ctypes.byref(pid_tmp)))
+    cur_tid = int(_kernel32.GetCurrentThreadId())
+    attached = False
+    try:
+        if fg_tid and fg_tid != cur_tid:
+            attached = bool(_user32.AttachThreadInput(cur_tid, fg_tid, True))
+        _user32.BringWindowToTop(hwnd_w)
+        _user32.SetForegroundWindow(hwnd_w)
+        try:
+            _user32.SetFocus(hwnd_w)
+        except Exception:
+            pass
+    except Exception as exc:  # noqa: BLE001
+        log(f"force_foreground 异常: {exc}", "WARN")
+    finally:
+        if attached:
+            try:
+                _user32.AttachThreadInput(cur_tid, fg_tid, False)
+            except Exception:
+                pass
+    ok = _hwnd_int(_user32.GetForegroundWindow()) == h
+    log(f"force_foreground: 目标 hwnd={h} 置前{'成功' if ok else '失败'}"
+        f"（当前前台 hwnd={_hwnd_int(_user32.GetForegroundWindow())}）", "INFO" if ok else "WARN")
+    return ok
+
+
+def prealign_window(hwnd, cfg):
+    """★#14★ 连接 Win32Controller 之前，把窗口一次性摆进主屏工作区（DPI-aware 物理像素）。
+
+    目的：让框架 ensure_window_on_screen() 判 need_change=False 直接返回，切断 175% DPI 下
+    「GetClientRect(逻辑) / GetWindowRect(物理) 混用 → frame 虚高 → SetWindowPos 逐次放大」的正反馈。
+    默认仅移动（SWP_NOSIZE），规避 DPI-unaware 目标窗口的尺寸换算歧义；仅当尺寸超出工作区才 resize。
+    返回目标矩形 (x,y,w,h)；跳过/失败返回 None。
+    """
+    pa = (cfg.get("window") or {}).get("prealign") or {}
+    if not pa.get("enabled", True):
+        log("窗口预调整已禁用（window.prealign.enabled=false）", "WARN")
+        return None
+    h = _hwnd_int(hwnd)
+    mon = get_monitor_work_rect(h)
+    cur = get_window_rect_px(h)
+    if mon is None or cur is None:
+        log("窗口预调整跳过：无法获取显示器工作区或窗口矩形", "WARN")
+        return None
+    target = compute_prealign_rect(mon, cur, pa.get("desired_size"))
+    summary = (f"原始 pos=({cur[0]},{cur[1]}) size={cur[2]}x{cur[3]} | "
+               f"rcWork(l,t,r,b)={mon} | 目标 pos=({target[0]},{target[1]}) size={target[2]}x{target[3]}")
+    if target == cur:
+        log(f"窗口预调整: 已在工作区内，无需移动（{summary}）")
+        return target
+    same_size = (target[2], target[3]) == (cur[2], cur[3])
+    if same_size:
+        ok = set_window_pos(h, target[0], target[1], 0, 0,
+                            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER)
+        mode = "仅移动(SWP_NOSIZE)"
+    else:
+        ok = set_window_pos(h, target[0], target[1], target[2], target[3],
+                            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER)
+        mode = "移动+缩放"
+    log(f"窗口预调整[{mode}] {'成功' if ok else '失败'}：{summary}", "INFO" if ok else "WARN")
+    return target
+
+
+class GameProcessMonitor:
+    """通过窗口句柄解析 PID，检测窗口销毁 / 进程退出（游戏静默自退），并记录权限状态。"""
+
+    def __init__(self, hwnd) -> None:
+        self.hwnd_int = _hwnd_int(hwnd)
+        pid = wintypes.DWORD(0)
+        _user32.GetWindowThreadProcessId(wintypes.HWND(self.hwnd_int), ctypes.byref(pid))
+        self.pid = int(pid.value)
+        self.elevated = is_process_elevated(self.pid)  # True/False/None
+        self.first_seen = time.monotonic()  # 窗口首次发现时间，用于「连续存活 ≥60s」口径
+        log(f"进程监控已绑定: hwnd={self.hwnd_int} pid={self.pid} "
+            f"target_elevated={self.elevated} self_elevated={is_self_elevated()}")
+
+    def alive_duration(self) -> float:
+        """窗口连续存活秒数。§5-4『连续存活 ≥60s 判本次启动可用』仅用于
+        重启决策/确定性失败标注的观测口径，★不作为登录前置等待、不是长期保活★。"""
+        return time.monotonic() - self.first_seen
+
+    def alive(self) -> bool:
+        if not _user32.IsWindow(wintypes.HWND(self.hwnd_int)):
+            return False
+        if self.pid:
+            handle = _kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, self.pid)
+            if handle:
+                try:
+                    code = wintypes.DWORD()
+                    ok = _kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+                    if ok:
+                        return int(code.value) == STILL_ACTIVE
+                finally:
+                    _kernel32.CloseHandle(handle)
+        return True
+
+
+# --------------------------------------------------------------------------- #
+# 窗口发现（可单元测试）
+# --------------------------------------------------------------------------- #
+def pick_window(windows, wcfg: dict, usable=None):
+    """按 window_name 含 name_include 命中，排除工具窗/IME 隐藏窗，记录 class_name 兜底。
+
+    usable: callable(hwnd_int)->bool，用于排除 0×0/不可见窗口；None 时跳过（单测用）。
+    """
+    include = wcfg["name_include"]
+    excludes = wcfg.get("exclude_names", [])
+    exclude_classes = wcfg.get("exclude_class_names", [])
+    fallback_cls = wcfg.get("class_name_fallback", "")
+    for w in windows:
+        name = w.window_name or ""
+        cls = w.class_name or ""
+        if any(ex and ex in name for ex in excludes):
+            continue
+        if cls in exclude_classes:
+            continue
+        hit = include in name
+        if not hit and fallback_cls and fallback_cls in cls:
+            hit = True
+        if not hit:
+            continue
+        if usable is not None and not usable(_hwnd_int(w.hwnd)):
+            continue
+        return w
+    return None
+
+
+def wait_for_window(cfg: dict, hard_deadline: float):
+    lcfg = cfg["launch"]
+    timeout = float(lcfg["window_poll_timeout_sec"])
+    interval = float(lcfg["window_poll_interval_sec"])
+    deadline = min(hard_deadline, time.monotonic() + timeout)
+    wcfg = cfg["window"]
+    log(f"轮询等待目标窗口（最多 {timeout:.0f}s，name 含 {wcfg['name_include']!r} "
+        f"/ class {wcfg.get('class_name')!r}，排除工具窗与 IME 隐藏窗）")
+    while True:
+        windows = Toolkit.find_desktop_windows()
+        win = pick_window(windows, wcfg, usable=window_usable if wcfg.get("require_visible_sized") else None)
+        if win is not None:
+            log(f"发现窗口: hwnd={_hwnd_int(win.hwnd)} "
+                f"class_name={win.class_name!r} window_name={win.window_name!r}")
+            return win
+        if time.monotonic() >= deadline:
+            names = [(w.window_name, w.class_name) for w in windows]
+            raise TimeoutError(
+                f"窗口轮询超时({timeout:.0f}s/整体超时)未发现目标窗口 "
+                f"{wcfg['name_include']!r}；当前桌面窗口: {names}"
+            )
+        time.sleep(interval)
+
+
+# --------------------------------------------------------------------------- #
+# ★启动命令单一函数★（只用现有 .lnk，os.startfile / ShellExecute）
+# --------------------------------------------------------------------------- #
+def launch_game(cfg: dict) -> str:
+    """★启动命令单一决策点★ launch.mode 锁定为 lnk；绝不解析/复述 .lnk 内嵌令牌，
+    绝不直接拉 imasscprism.exe，无 DMMGamePlayer/协议分支，无令牌刷新逻辑。"""
+    mode = cfg["launch"].get("mode", "lnk")
+    if mode != "lnk":
+        raise RuntimeError(f"launch.mode 锁定为 lnk，不接受 {mode!r}；不存在第二种启动方式")
+    path = cfg["launch"]["lnk_path"]
+    if not Path(path).exists():
+        raise FileNotFoundError(f"快捷方式不存在: {path}")
+    os.startfile(path)  # ShellExecute：由 .lnk 的 Arguments 在启动前完成 DMM 认证
+    return f"os.startfile(.lnk) path={path}"
+
+
+# --------------------------------------------------------------------------- #
+# ★点击决策集中点★（用户已拍板 click_to_start=true：点击 TOUCH TO START 进入游戏）
+# --------------------------------------------------------------------------- #
+def select_task(cfg: dict) -> tuple[str, str, str]:
+    """返回 (入口节点, 界面标志节点, 成功标志节点)。"""
+    if cfg["flow"]["click_to_start"]:
+        return "LoginAndStart", "TitleScreenDetectedClick", "InGameSuccess"
+    return "LoginTitleOnly", "TitleScreenDetected", "LoginSuccess"
+
+
+# --------------------------------------------------------------------------- #
+# ★P0-0 校准参数单一来源★ 供 pipeline 注入与 Python 侧 button_visible_fn 共用，
+# 保证「识别按钮是否可见」与「点击按钮」用的是同一套已校准模板/roi/阈值/算法。
+# --------------------------------------------------------------------------- #
+def build_detection_params(cfg: dict) -> dict:
+    """返回 TemplateMatch 的识别参数字典（pipeline v1 格式）。
+    ★4 模板数组 + 局部 roi + 实测 threshold，见 config.calibration / artifacts/09-calibration.md。"""
+    rec = cfg["recognition"]
+    tpl = rec["template"]
+    params = {
+        "recognition": "TemplateMatch",
+        "template": list(tpl["files"]),   # 多模板数组：跨立绘轮播稳健
+        "threshold": tpl["threshold"],
+        "method": tpl["method"],
+    }
+    if tpl.get("roi"):
+        params["roi"] = list(tpl["roi"])  # 局部锚定按钮区，避开全图轮播
+    return params
+
+
+def build_marker_params(cfg: dict):
+    """★#22★ 把 `recognition.in_game_marker_template`（字符串或数组）规范化为
+    **每个模板各自的 (file, roi, threshold)**，供 make_marker_hit_fn / build_pipeline_override 共用。
+
+    返回 dict 或 **None**。以下任一情况返回 None（硬守护）：marker 为 null / 空数组 /
+    全空字符串 / 任一模板文件在 `resource/image/` 下缺失 / 阈值低于下限 / 阈值数组长度
+    与模板数不一致。调用方必须据此禁用正向判定，绝不判 OK_MARKER、绝不回退到裸 inverse
+    （模板不匹配 ≠ 成功）。
+
+    `in_game_marker_threshold` / `in_game_marker_roi` 可为单值（广播到全部模板）或与模板
+    等长的数组（每模板各自参数，#22 校准即用数组）。★#23 P2★ 空阈值数组回退默认 0.7 广播
+    （不再触发 thrs[-1] IndexError）。★#25 P1-1★ 阈值数组长度与模板数不一致（单模板
+    可插拔路径除外）或任一阈值 <0.55 → WARN + 返回 None：真实 MaaFW 判定器实测标题帧
+    `home_lb_diamond` score=0.507051，阈值 ≤0.507 会把标题帧误命中 → OK_MARKER 假成功；
+    当前校准 [0.55,0.75,0.6] 用 `<0.55` 严格小于判断，正好通过。
+    """
+    rec = cfg["recognition"]
+    tpl = rec.get("in_game_marker_template")
+    if not tpl:
+        return None
+    files = [tpl] if isinstance(tpl, str) else list(tpl)
+    files = [f for f in files if isinstance(f, str) and f.strip()]
+    if not files:
+        return None
+    missing = [f for f in files if not (IMAGE_DIR / f).is_file()]
+    if missing:
+        log(f"主界面模板文件缺失 {missing} → 正向标志禁用（绝不判 OK_MARKER）", "WARN")
+        return None
+
+    thr_cfg = rec.get("in_game_marker_threshold", 0.7)
+    thrs = ([float(t) for t in thr_cfg] if isinstance(thr_cfg, (list, tuple))
+            else [float(thr_cfg)])
+    # ★#23 P2-1★ 空阈值数组回退默认 0.7 再广播，避免 thrs[-1] IndexError 让 run() 崩溃
+    if not thrs:
+        thrs = [0.7]
+        log("主界面阈值数组为空 → 回退默认 0.7 广播", "WARN")
+    # ★#25 P1-1★ 阈值长度硬校验：单值广播保留；单模板（可插拔）只取首个阈值；
+    # 多模板时长度必须严格相等，不再末值补齐/截断（畸形数组会挑出低阈值 → 假成功）。
+    if len(files) == 1:
+        if len(thrs) > 1:
+            log(f"单模板配置忽略多余阈值项 {thrs[1:]}，仅用 {thrs[0]}", "WARN")
+        thrs = thrs[:1]
+    elif len(thrs) == 1:
+        thrs = thrs * len(files)
+    elif len(thrs) != len(files):
+        log(f"主界面阈值数组长度 {len(thrs)} 与模板数 {len(files)} 不一致 → "
+            f"正向标志禁用（绝不判 OK_MARKER）", "WARN")
+        return None
+    # ★#25 P1-1★ 阈值下限：标题帧 lb 模板真实判定器负样本上界 0.507051，
+    # 任何 <0.55 的阈值都可能把标题帧误命中；绝不静默接受（WARN + 禁用）。
+    if any(t < 0.55 for t in thrs):
+        log(f"主界面阈值 {thrs} 含 <0.55 的值 → 正向标志禁用"
+            f"（标题帧负样本上界 0.507，绝不假成功）", "WARN")
+        return None
+
+    roi_cfg = rec.get("in_game_marker_roi") or []
+    rois = []
+    for i in range(len(files)):
+        r = roi_cfg[i] if i < len(roi_cfg) else None
+        rois.append(list(r) if r else None)
+    return {"template": files, "roi": rois, "threshold": thrs, "method": 5}
+
+
+# --------------------------------------------------------------------------- #
+# 把识别方式 / 超时 / 画面稳定 / 黑屏阈值等配置注入 pipeline（merge 语义部分覆盖）
+# --------------------------------------------------------------------------- #
+def build_pipeline_override(cfg: dict) -> dict:
+    rec = cfg["recognition"]
+    flow = cfg["flow"]
+
+    if rec["method"] == "template":
+        detection = build_detection_params(cfg)
+    elif rec["method"] == "ocr":
+        detection = {
+            "recognition": "OCR",
+            "expected": rec["ocr"]["expected"],
+            "threshold": rec["ocr"]["threshold"],
+        }
+        if rec["template"].get("roi"):
+            detection["roi"] = list(rec["template"]["roi"])  # 局部锚定按钮区，避免全图 OCR 干扰
+    else:
+        raise ValueError(f"未知 recognition.method: {rec['method']!r}（应为 template / ocr）")
+
+    override: dict[str, dict] = {
+        "TitleScreenDetected": dict(detection),
+        "TitleScreenDetectedClick": dict(detection),
+        "InGameSuccess": dict(detection),
+        # timeout 设在「等待下一节点」的上一节点（入口 / WaitInGame）
+        "LoginTitleOnly": {"timeout": flow["title_wait_timeout_ms"], "rate_limit": flow["rate_limit_ms"]},
+        "LoginAndStart": {"timeout": flow["title_wait_timeout_ms"], "rate_limit": flow["rate_limit_ms"]},
+        "WaitInGame": {"timeout": flow["post_click_timeout_ms"], "rate_limit": flow["rate_limit_ms"]},
+        "HandleLoadingScreen": {"custom_recognition_param": {
+            "black_mean_max": rec["loading_frame"]["black_mean_max"],
+            "white_mean_min": rec["loading_frame"]["white_mean_min"],
+            "white_std_max": rec["loading_frame"]["white_std_max"],
+            "std_min": rec["loading_frame"]["std_min"],
+            # ★#21★ 加载页模板判据（淡蓝背景 + Now Loading...，统计判据覆盖不到）
+            "loading_template": rec.get("loading_template", {}).get("file"),
+            "loading_template_threshold": rec.get("loading_template", {}).get("threshold", 0.6),
+            "loading_template_roi": rec.get("loading_template", {}).get("roi", [860, 630, 340, 90]),
+        }},
+    }
+    # ★#18★ 点击目标：login.json 用 action=Custom / custom_action=ClickCenter 精确点识别框中心，
+    # 不再用 target:true（其背后是 Actuator::rand_point 的正态随机点，可能落框沿）。
+    # 也绝不注入母图绝对坐标：运行时帧 1280×720、模板母图 860×720，宽差会错位。
+    # ★轮播★ 不注入全图 pre/post_wait_freezes：标题画面角色立绘持续轮播(diff 37~76)，全图差分等静止
+    # 会让节点超时。画面稳定改由 Python 侧 confirm_not_loading_stable() 用加载态统计 + 进程存活实现。
+
+    # ★#22/#23★ InGameSuccess 节点【恒保持】inverse=true + 按钮模板 —— 它只是「离开标题/
+    # 按钮消失」的前置信号，绝不是成功判定。权威正向判定全在 Python 侧
+    # （make_marker_hit_fn / post_click_verify / #23 新增 direct_marker_confirm）。这样
+    # OK_DEGRADED_UNVERIFIED(exit 3) 三态完整保留，也绝不出现「裸 inverse 单帧命中即成功」；
+    # 若切成正向 marker 识别，主界面未出现时 sink.is_success 恒为 False、exit 3 将不可达。
+    # ★#23 P1-1★ 删除曾生成的 InGameMarker_0/1/2：它们 next=[] 且无任何 next/on_error 指入，
+    # 合并 login.json 后是**孤立死节点、永不执行**；且「含这些节点的完整 override 喂给
+    # post_task」从未离线验证过（历史「自测全过实跑翻车」盲区）。正向判定不需要 pipeline 冗余节点。
+    override["InGameSuccess"]["inverse"] = True
+    return override
+
+
+# --------------------------------------------------------------------------- #
+# 单任务监控：进程存活 + 整体 wall-clock 超时（不阻塞在 .wait()，避免死等）
+# --------------------------------------------------------------------------- #
+def monitor_job(job, tasker: Tasker, monitor: GameProcessMonitor,
+                deadline: float, interval: float) -> str:
+    while not job.done:
+        if not monitor.alive():
+            tasker.post_stop()
+            return FAIL_PROCESS_DIED
+        if time.monotonic() > deadline:
+            tasker.post_stop()
+            return FAIL_OVERALL_TIMEOUT
+        time.sleep(interval)
+    return "DONE"
+
+
+def wait_target_geometry(ctrl, cfg: dict, *, timeout_sec: float = 15.0,
+                         sleep_fn=None, log_fn=None) -> tuple[bool, str]:
+    """★#18★ 点击前的几何守卫：等待截图目标尺寸收敛到「长边 1280 / 高 720」。
+
+    背景（第0步实测）：日志 `Resolution changed` 只在 02:10:11（raw 2532×1447，窗口刚被
+    prealign 改尺寸）与 02:10:16（raw 2240×1260 = 1280×720@175%）出现两次，之后再未变化。
+    即模板几何只在启动最初几秒不吻合；点错坐标的代价远大于多等几秒，故点击前显式收敛。
+    返回 (是否可用, 说明)；不可用时调用方必须禁用点击（不得盲目点）。
+    """
+    want_w = int(cfg["controller"].get("screenshot_target_long_side", 1280))
+    want_h = int(cfg["controller"].get("geometry_expect_height", 720))
+    tol = int(cfg["controller"].get("geometry_height_tolerance", 4))
+    wait_sec = float(cfg["controller"].get("geometry_wait_sec", 15.0)) if timeout_sec is None else timeout_sec
+    sleep_fn = sleep_fn or time.sleep
+    log_fn = log_fn or log
+    end = time.monotonic() + max(0.0, wait_sec)
+    last = ""
+    while True:
+        try:
+            frame = ctrl.post_screencap().wait().get()
+            h, w = int(frame.shape[0]), int(frame.shape[1])
+            last = f"{w}x{h}"
+            if w == want_w and abs(h - want_h) <= tol:
+                log_fn(f"几何守卫: 截图目标 {w}x{h} 与模板校准几何 {want_w}x{want_h} 一致")
+                return True, last
+        except Exception as exc:  # noqa: BLE001 - 截图失败不应直接中断
+            last = f"截图异常: {exc}"
+        if time.monotonic() >= end:
+            log_fn(f"几何守卫: {wait_sec:.0f}s 内未收敛到 {want_w}x{want_h}±{tol}（最后 {last}），"
+                   f"本轮禁用点击以免点错坐标", "WARN")
+            return False, last
+        sleep_fn(0.5)
+
+
+def build_session(cfg: dict, res: Resource, win):
+    """建立一次控制会话：连接控制器、绑定 Tasker、挂事件回调、进程监控。失败返回 None。"""
+    # ★#14★ 连接前一次性把窗口摆进主屏工作区（DPI-aware），使框架 ensure_window_on_screen
+    # 判 need_change=False，切断 175% DPI 下的正反馈放大。失败不阻断连接。
+    try:
+        prealign_window(win.hwnd, cfg)
+    except Exception as exc:  # noqa: BLE001 - 预调整异常不应阻断连接
+        log(f"窗口预调整异常（继续连接）: {exc}", "WARN")
+    # ★#18★ 连接后立即可靠置前（上次会话窗口始终非前台导致 Seize 点击未生效）。
+    try:
+        force_foreground(win.hwnd)
+    except Exception as exc:  # noqa: BLE001
+        log(f"置前异常（继续连接）: {exc}", "WARN")
+    screencap, mouse, keyboard = resolve_controller_methods(cfg)
+    ctrl = Win32Controller(win.hwnd, screencap, mouse, keyboard)  # 位置参数：binding 是 hWnd
+    conn_job = ctrl.post_connection()
+    conn_job.wait()
+    if not conn_job.succeeded:
+        log("post_connection 失败", "ERROR")
+        return None
+    # ★#18 第0步结论★ 帧宽"波动"的真正来源不是窗口几何，而是调试图拼接：
+    # TemplateMatcher::draw_result() 会把模板缩略图拼在右侧（copyMakeBorder(..., templ.cols)，
+    # TemplateMatcher.cpp:143-146），旧模板宽 230 → vision 里 1280 帧显示为 1510、1260 显示为 1490；
+    # 真实 image_target 只有 1260（窗口刚被 prealign 改尺寸的 5s 过渡）与 1280（其后稳定）两种。
+    # 因此不需要多尺度模板：把缩放基准从「短边 720」改成「长边 1280」，横屏窗口的
+    # 模板坐标系宽度恒等于 1280，任何窗口比例下按钮 x 坐标都不再漂移（16:9 → 1280×720 与旧值完全一致）。
+    long_side = int(cfg["controller"].get("screenshot_target_long_side", 1280))
+    ctrl.set_screenshot_target_long_side(long_side)
+    log(f"控制器已连接: screencap={cfg['controller']['screencap']} "
+        f"mouse={cfg['controller']['mouse']} keyboard={cfg['controller']['keyboard']} "
+        f"长边={long_side}（模板按 1280×720 校准）")
+    tasker = Tasker()
+    tasker.bind(res, ctrl)
+    if not tasker.inited:
+        log("Tasker 初始化失败", "ERROR")
+        return None
+    sink = NodeEventSink()
+    if tasker.add_context_sink(sink) is None:
+        log("add_context_sink 失败，无法据界面标志判定成功", "ERROR")
+        return None
+    monitor = GameProcessMonitor(win.hwnd)
+    return (ctrl, tasker, sink, monitor, _hwnd_int(win.hwnd))
+
+
+# --------------------------------------------------------------------------- #
+# ★第5项补正★ Python 侧「连续稳定 5~10s」成功复检（降级判定模式的核心）
+# --------------------------------------------------------------------------- #
+def make_button_visible_fn(tasker: Tasker, cfg: dict):
+    """返回 callable(frame)->bool：用框架 post_recognition 正向 TemplateMatch
+    复检当前帧里 TOUCH TO START 按钮是否仍可见。
+
+    ★P0-0★ 与 TitleScreenDetectedClick 共用 build_detection_params() 的同一套
+    已校准参数（4 模板数组 + roi + threshold），不再用失效的单模板。实测：
+    12 张按钮可见真实帧全部 hit=True，黑/白屏加载态真实帧 + 纯色帧全部 hit=False。
+    """
+    p = build_detection_params(cfg)
+    reco_param = JTemplateMatch(
+        template=list(p["template"]),
+        threshold=[p["threshold"]],
+        method=p["method"],
+    )
+    if p.get("roi"):
+        reco_param.roi = tuple(p["roi"])
+
+    def _visible(frame) -> bool:
+        try:
+            import numpy as np
+            job = tasker.post_recognition(JRecognitionType.TemplateMatch, reco_param,
+                                          np.ascontiguousarray(frame))
+            job.wait()
+            detail = job.get()
+            nid = detail.node_id_list[0] if (detail and getattr(detail, "node_id_list", None)) else None
+            if nid is None:
+                return False
+            node = tasker.get_node_detail(nid)
+            return bool(getattr(getattr(node, "recognition", None), "hit", False))
+        except Exception as exc:  # noqa: BLE001 - 无法确定时保守处理，阻止提前成功
+            log(f"按钮可见性复检异常（按保守处理）: {exc}", "WARN")
+            return True
+
+    return _visible
+
+
+def confirm_in_game_stable(cfg: dict, *, screencap_fn, is_alive_fn, button_visible_fn,
+                           log_fn=log, now_fn=time.monotonic, sleep_fn=time.sleep) -> tuple[bool, str]:
+    """★降级判定模式核心★ 点击后必须连续 in_game_stable_sec(5~10s) 同时满足：
+      ① 按钮不可见（TOUCH TO START 消失）② 画面非加载态（黑/白/低方差排除）
+      ③ 目标进程仍存活
+    任一不满足即重置稳定计时，避免『还在加载』被 inverse 误报成登录成功。
+    纯依赖注入：--check 用合成帧序列做单元测，不启动游戏、不点击真实窗口。
+    """
+    flow = cfg["flow"]
+    lf = cfg["recognition"]["loading_frame"]
+    duration = float(flow["in_game_stable_sec"])
+    interval = float(flow["stable_check_interval_sec"])
+    hard_deadline = now_fn() + float(flow["stable_confirm_timeout_sec"])
+    stable_start = None
+    last_unmet = None
+    checks = 0
+    while True:
+        if now_fn() > hard_deadline:
+            hint = f"（最后未满足: {last_unmet}）" if last_unmet else ""
+            return False, f"稳定确认超时({flow['stable_confirm_timeout_sec']}s){hint}"
+        if not is_alive_fn():
+            return False, "复检期间进程退出"
+        frame = screencap_fn()
+        checks += 1
+        reason = None
+        if is_loading_frame(frame, lf["black_mean_max"], lf["white_mean_min"], lf["std_min"]):
+            reason = "加载态(黑/白/低方差)"
+        elif button_visible_fn(frame):
+            reason = "TOUCH TO START 仍可见"
+        if reason:
+            last_unmet = reason
+            if stable_start is not None:
+                log_fn(f"复检#{checks}: {reason} → 重置稳定计时", "WARN")
+            stable_start = None
+        else:
+            if stable_start is None:
+                stable_start = now_fn()
+                log_fn(f"复检#{checks}: 条件满足，开始累计稳定窗口({duration:.0f}s)")
+            elif now_fn() - stable_start >= duration:
+                return True, (f"连续稳定 {now_fn() - stable_start:.1f}s："
+                              f"按钮不可见 + 非加载态 + 进程存活（共 {checks} 次复检）")
+        sleep_fn(interval)
+
+
+def save_probe_frame(frame, tag: str, *, log_fn=log, out_dir=None) -> str:
+    """★#21★ 取证留图：把当前**原始截图帧（1280×720，image_target 口径）**写到
+    `debug/screencap/in_game_probe_<时间戳>_<tag>.png`，供下次裁剪主界面模板。
+
+    - 存的是 controller 的 `cached_image`（post_screencap 结果），**不是** `debug/vision/` 那种
+      被 TemplateMatcher 拼接了模板缩略图、带识别框线的调试图；
+    - **只新增文件**：绝不覆盖/删除 `debug/` 下已有帧（红线）；
+    - 不依赖 Pillow/OpenCV（tools/make_template.encode_png 纯 Python）。
+    """
+    try:
+        import numpy as np
+        from make_template import encode_png  # tools/
+        if frame is None or getattr(frame, "size", 0) == 0:
+            log_fn(f"取证留图({tag})跳过：空帧", "WARN")
+            return ""
+        arr = np.asarray(frame)
+        if arr.ndim == 3 and arr.shape[2] == 3:
+            arr = arr[:, :, ::-1]            # BGR -> RGB
+        ts = time.strftime("%Y.%m.%d-%H.%M.%S") + f".{int(time.time() * 1000) % 1000:03d}"
+        out = Path(out_dir or (DEBUG_DIR / "screencap")) / f"in_game_probe_{ts}_{tag}.png"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        encode_png(np.ascontiguousarray(arr), out)
+        log_fn(f"取证留图: {out.name}（{arr.shape[1]}x{arr.shape[0]}，tag={tag}）")
+        return str(out)
+    except Exception as exc:  # noqa: BLE001 - 留图失败不得影响判定
+        log_fn(f"取证留图失败({tag}): {exc}", "WARN")
+        return ""
+
+
+def make_marker_hit_fn(tasker: Tasker, cfg: dict):
+    """★#22★ 返回 callable(frame)->bool：**任一**主界面正向模板在**各自 roi/threshold** 下命中。
+
+    spec 来自 build_marker_params()；其为 None（marker 为 null / 空数组 / 文件缺失）时返回
+    **None**，调用方不得判 OK_MARKER、绝不回退裸 inverse。JTemplateMatch.roi 是单个 JTarget，
+    无法在一个 recognition 里给多模板各自 roi，故每个模板单独一次 post_recognition。
+    """
+    spec = build_marker_params(cfg)
+    if spec is None:
+        return None
+    from maa.pipeline import JRecognitionType, JTemplateMatch
+    jobs = []
+    for f, roi, thr in zip(spec["template"], spec["roi"], spec["threshold"]):
+        kw = {"template": [f], "threshold": [thr], "method": spec["method"]}
+        if roi:
+            kw["roi"] = tuple(int(v) for v in roi)
+        jobs.append((f, JTemplateMatch(**kw)))
+
+    def _hit(frame) -> bool:
+        try:
+            import numpy as np
+            arr = np.ascontiguousarray(frame)
+            for f, reco in jobs:
+                try:
+                    job = tasker.post_recognition(JRecognitionType.TemplateMatch, reco, arr)
+                    job.wait()
+                    detail = job.get()
+                    nid = detail.node_id_list[0] if (detail and getattr(detail, "node_id_list", None)) else None
+                    if nid is None:
+                        continue
+                    node = tasker.get_node_detail(nid)
+                    if bool(getattr(getattr(node, "recognition", None), "hit", False)):
+                        return True
+                except Exception as exc:  # noqa: BLE001 - 单模板异常按未命中，继续其余模板
+                    log(f"主界面模板 {f} 匹配异常（按未命中）: {exc}", "WARN")
+                    continue
+        except Exception as exc:  # noqa: BLE001 - 保守：出错按未命中，避免误报 OK_MARKER
+            log(f"主界面模板匹配异常（按未命中）: {exc}", "WARN")
+        return False
+
+    return _hit
+
+
+def post_click_verify(cfg: dict, *, screencap_fn, is_alive_fn, button_visible_fn,
+                      marker_hit_fn=None, probe_fn=None, log_fn=None,
+                      loading_seen_before: bool = False,
+                      now_fn=time.monotonic, sleep_fn=time.sleep) -> tuple[str, str]:
+    """★#21★ 点击后 20~30s 持续采样，给出三态判定的「结论」，由 run() 映射成结果码。
+
+    verdict:
+      - `MARKER`      : 正向主界面模板命中 → OK_MARKER（确认进入）
+      - `LEFT_TITLE`  : 按钮连续 `in_game_absent_sec`(20s) 不可见且当前非加载态 → 仅"疑似成功"
+      - `STILL_TITLE` : 窗口结束时按钮仍反复可见（轮播淡入淡出会反复闪现）→ 仍在标题
+      - `SESSION_LOST`: 点击后进程/窗口消失（实测点击后客户端会重启）→ 交 run() 重连
+      - `TIMEOUT`     : 30s 内既无 marker，也凑不满连续不可见时长
+
+    设计依据（10:25~10:29 真实日志）：点击后 2~6s 裸 inverse 必然命中，但 10:26:11 / 10:28:18
+    的 screencap 仍是标题 LOGO 画面，`10:29:04` 消失后 `10:29:06` 按钮又出现——单帧缺失毫无意义。
+    所以窗口拉到 30s，且要求「连续 20s 不见」才给疑似结论，绝不因单帧缺失判成功。
+    """
+    flow = cfg["flow"]
+    lf = cfg["recognition"]["loading_frame"]
+    lt = cfg["recognition"].get("loading_template") or {}
+    log_fn = log_fn or log
+    window = float(flow.get("in_game_verify_sec", 30))
+    max_window = float(flow.get("in_game_verify_max_sec", 90))
+    absent_need = float(flow.get("in_game_absent_sec", 20))
+    # ★#21★ 若 pipeline 已经观察到加载页（loading_seen_before），说明画面确实离开过标题，
+    # 缺席门槛可以缩短（加载结束本身就是强证据），否则仍要求完整的连续缺席时长。
+    if loading_seen_before:
+        absent_need = min(absent_need, float(flow.get("in_game_absent_after_loading_sec", 5)))
+    interval = float(flow.get("verify_sample_interval_sec", 1.0))
+    grace = float(flow.get("post_click_grace_sec", 3.0))
+
+    start = now_fn()
+    absent_since = None
+    samples = 0
+    loading_seen = False
+    last_visible_at = None
+
+    while True:
+        if not is_alive_fn():
+            return "SESSION_LOST", f"点击后目标进程消失（{now_fn() - start:.1f}s，疑似客户端重启）"
+        try:
+            frame = screencap_fn()
+        except Exception as exc:  # noqa: BLE001 - 截图失败按会话丢失处理
+            return "SESSION_LOST", f"点击后截图失败（{exc}）"
+        if frame is None or getattr(frame, "size", 0) == 0:
+            return "SESSION_LOST", "点击后截图返回空帧"
+
+        samples += 1
+        elapsed = now_fn() - start
+        loading, linfo = detect_loading_frame(
+            frame, black_mean_max=lf["black_mean_max"], white_mean_min=lf["white_mean_min"],
+            std_min=lf["std_min"], white_std_max=lf["white_std_max"],
+            template=lt.get("file"), template_threshold=lt.get("threshold", 0.6),
+            template_roi=tuple(lt.get("roi", (860, 630, 340, 90))),
+        )
+        loading_seen = loading_seen or loading
+
+        # ★#22★ 加载态帧绝不参与正向判定（不得把加载态误判为成功）
+        if not loading and marker_hit_fn is not None and marker_hit_fn(frame):
+            if probe_fn:
+                probe_fn(frame, "marker_hit")
+            return "MARKER", f"第 {samples} 次采样命中正向主界面模板（{elapsed:.1f}s）"
+
+        vis = bool(button_visible_fn(frame))
+        if elapsed >= grace:
+            if vis:
+                last_visible_at = elapsed
+                absent_since = None
+            elif absent_since is None:
+                absent_since = now_fn()
+
+        log_fn(f"  判定采样#{samples} t={elapsed:.1f}s mean={float(frame.mean()):.0f} "
+               f"std={float(frame.std()):.0f} loading={loading}({linfo.get('reason')}"
+               f"{'' if 'tpl_score' not in linfo else f',tpl={linfo['tpl_score']}'}) "
+               f"button_visible={vis}")
+
+        if absent_since is not None and not loading and now_fn() - absent_since >= absent_need:
+            if probe_fn:
+                probe_fn(frame, "unverified")
+            return "LEFT_TITLE", (f"按钮连续 {now_fn() - absent_since:.1f}s 不可见且非加载态"
+                                  f"（{samples} 次采样，期间观察到加载态={loading_seen}），"
+                                  f"但无正向主界面标志 → 仅疑似成功")
+
+        if now_fn() - start >= window:
+            # ★#21★ 窗口到期但画面仍在加载页（用户实测加载页可长达数十秒）→ 延长，不判失败
+            if loading and window < max_window:
+                window = min(window + float(flow.get("in_game_verify_sec", 30)), max_window)
+                log_fn(f"  判定窗口到期但仍在加载态，延长到 {window:.0f}s（上限 {max_window:.0f}s）")
+                sleep_fn(interval)
+                continue
+            if probe_fn:
+                probe_fn(frame, "still_title" if last_visible_at is not None else "timeout")
+            if last_visible_at is not None:
+                return "STILL_TITLE", (f"{window:.0f}s 窗口内按钮仍反复可见"
+                                       f"（最后一次可见 t={last_visible_at:.1f}s）")
+            return "TIMEOUT", (f"{window:.0f}s 窗口结束仍未确认"
+                               f"（按钮不可见时长不足 {absent_need:.0f}s，loading_seen={loading_seen}）")
+
+        sleep_fn(interval)
+
+
+def direct_marker_confirm(frame, cfg: dict, marker_hit_fn, *, log_fn=None, probe_fn=None) -> bool:
+    """★#23 P1-2★ 主界面正向「直判」：非加载态帧 + 任一主界面模板命中 → True（→ OK_MARKER/0）。
+
+    背景：点击后客户端会重启 → post_click_verify 返回 SESSION_LOST → run() 丢弃会话重连。
+    重连后若游戏**直接落在主界面**（按钮不可见），`TitleScreenDetectedClick` 本轮永不命中 →
+    `sink.is_success()`=False → 门控 continue → post_click_verify（原来唯一能做 OK_MARKER 的入口）
+    永不调用 → 「明明进了游戏却判失败」。#22 把正向判定挂在了「标题→点击→按钮消失」信号链之后，
+    重连正好打破这条链。故 run() 在每轮 pipeline 前/门控前用本函数对当前帧直判一次，绕开该门槛。
+
+    硬守护（与 post_click_verify 一致，绝不引入假成功）：
+      - marker_hit_fn 为 None（marker=null/空数组/文件缺失）→ False，绝不回退裸 inverse；
+      - 空帧 → False；加载态帧 → False（不得把加载态误判成功）；判加载异常 → False；
+      - 标题帧实测 3 模板零命中（NCC 表 / --check [24]）；
+      - 只返回 bool，由调用方决定是否 return OK_MARKER，三态 0/3/2 仍全部可达。
+    """
+    if marker_hit_fn is None or frame is None or getattr(frame, "size", 0) == 0:
+        return False
+    log_fn = log_fn or log
+    rec = cfg["recognition"]
+    lf = rec["loading_frame"]
+    lt = rec.get("loading_template") or {}
+    try:
+        loading, _ = detect_loading_frame(
+            frame, black_mean_max=lf["black_mean_max"], white_mean_min=lf["white_mean_min"],
+            std_min=lf["std_min"], white_std_max=lf["white_std_max"],
+            template=lt.get("file"), template_threshold=lt.get("threshold", 0.6),
+            template_roi=tuple(lt.get("roi", (860, 630, 340, 90))),
+        )
+    except Exception as exc:  # noqa: BLE001 - 保守：判加载失败不直判
+        log_fn(f"主界面直判：加载态判定异常（按未命中）: {exc}", "WARN")
+        return False
+    if loading:
+        return False
+    if not marker_hit_fn(frame):
+        return False
+    if probe_fn:
+        try:
+            probe_fn(frame, "marker_hit")
+        except Exception as exc:  # noqa: BLE001 - 留图失败不影响判定
+            log_fn(f"主界面直判留图异常（忽略）: {exc}", "WARN")
+    return True
+
+
+def run(cfg: dict, skip_launch: bool = False) -> tuple[bool, str]:
+    init_framework_logging()
+    # ★#14★ 本进程设为 Per-Monitor DPI aware，保证窗口预调整/读取用物理像素（175% 缩放下必需）。
+    log(f"DPI 感知: {init_dpi_awareness()}")
+    log(f"MaaFramework 版本: {Library.version()}")
+    log(f"开关: flow.click_to_start={cfg['flow']['click_to_start']}  "
+        f"controller={cfg['controller']['screencap']}/{cfg['controller']['mouse']}/"
+        f"{cfg['controller']['keyboard']}  recognition={cfg['recognition']['method']!r}")
+    degraded = build_marker_params(cfg) is None  # ★#22★ 空/缺文件也算降级模式
+    log("成功判定模式: " + (
+        "【无主界面模板】点击后持续采样 20~30s：只能给出『疑似成功(OK_DEGRADED_UNVERIFIED)』，"
+        "不会伪装成确认成功"
+        if degraded else "【正向模式 OK_MARKER】主界面模板命中才判确认成功"))
+
+    # 0) 权限自检（实跑前置；--check 不走此路径）
+    if not require_elevation(cfg):
+        return False, FAIL_NOT_ELEVATED
+
+    # 资源只建一次（自定义识别注册一次，重启兜底复用）
+    res = Resource()
+    if not res.register_custom_recognition(CUSTOM_RECO_NAME, LoadingScreenReco()):
+        log("注册 LoadingScreenReco 失败", "ERROR")
+        return False, FAIL_RESOURCE
+    # ★#18★ 注册自定义动作 ClickCenter（精确点击识别框中心）
+    if not res.register_custom_action("ClickCenter", ClickCenterAction()):
+        log("注册 ClickCenter 自定义动作失败", "ERROR")
+        return False, FAIL_RESOURCE
+    bundle_job = res.post_bundle(str(RESOURCE_DIR))
+    bundle_job.wait()
+    if not bundle_job.succeeded:
+        log(f"加载 Bundle 失败: {RESOURCE_DIR}", "ERROR")
+        return False, FAIL_RESOURCE
+    log(f"Bundle 已加载: {RESOURCE_DIR}")
+
+    entry, marker_node, success_node = select_task(cfg)
+    override = build_pipeline_override(cfg)
+    log(f"任务入口={entry} 界面标志节点={marker_node} 成功标志节点={success_node}")
+    log(f"pipeline_override={json.dumps(override, ensure_ascii=False)}")
+
+    flow = cfg["flow"]
+    overall_deadline = time.monotonic() + float(flow["overall_timeout_sec"])
+    interval = float(flow["process_check_interval_sec"])             # 2~3s 轮询
+    attempt_cap = (flow["title_wait_timeout_ms"] + flow["post_click_timeout_ms"]) / 1000.0 + 20
+    max_restarts = int(flow["max_restarts"])                         # 2
+    max_starts = max_restarts + 1                                    # 合计最多 3 次启动
+    rate_window = float(flow["start_rate_window_sec"])               # 600s（5~10 分钟）
+    max_starts_per_window = int(flow["max_starts_per_window"])       # 3
+    restart_wait = float(flow["restart_wait_sec"])                   # 10~15s
+    stable_alive = float(flow["stable_alive_sec"])                   # 60s 启动稳定性口径
+
+    start_times: list[float] = []  # 每次 launch 的时间（限流用）
+    start_count = 0
+    restarts = 0
+    session = None
+    last_reason = "首次运行"
+    # ★#18★ 受控点击（P1-8）：单次 run() 内最多 max_clicks(默认2) 次；达上限后禁用点击，不无限重试。
+    click_count = 0
+    max_clicks = int(flow.get("max_clicks", 2))
+    total_attempt_limit = max_starts * 2 + 1  # 含复用会话重跑，硬上限防无限循环
+
+    log(f"兜底参数(06-diagnosis.md §5-4): 轮询={interval}s 启动确认超时="
+        f"{cfg['launch']['window_poll_timeout_sec']}s 连续存活≥{stable_alive:.0f}s判本次可用(仅观测口径,非登录前置)"
+        f" 退出后等{restart_wait:.0f}s再重启 最多重启{max_restarts}次(合计{max_starts}次启动) "
+        f"{int(rate_window)}s内≤{max_starts_per_window}次启动 第3次同窗退出判确定性失败并停止上报")
+
+    for attempt in range(1, total_attempt_limit + 1):
+        if time.monotonic() > overall_deadline:
+            log("整体超时（overall_timeout_sec）已到，放弃", "ERROR")
+            return False, FAIL_OVERALL_TIMEOUT
+
+        # 无会话 → 需要（重新）启动一次
+        if session is None:
+            now = time.monotonic()
+            recent = [t for t in start_times if now - t < rate_window]
+            if len(recent) >= max_starts_per_window:
+                log(f"限流：最近 {int(rate_window)}s 内已启动 {len(recent)} 次，达到上限 "
+                    f"{max_starts_per_window}（避免触发 GameGuard 风控）；停止重试并上报确定性失败。", "ERROR")
+                return False, FAIL_DETERMINISTIC
+            if start_count >= max_starts:
+                log(f"启动次数已达上限 {max_starts}（最多重启 {max_restarts} 次）；"
+                    f"停止重试并上报确定性失败。", "ERROR")
+                return False, FAIL_DETERMINISTIC
+            if not skip_launch:
+                try:
+                    log(f"[{time.strftime('%H:%M:%S')}] 第 {start_count + 1}/{max_starts} 次启动: {launch_game(cfg)}")
+                except (FileNotFoundError, RuntimeError, ValueError, OSError) as exc:
+                    log(f"启动失败: {exc}", "ERROR")
+                    return False, FAIL_LAUNCH
+                start_times.append(now)
+                start_count += 1
+            else:
+                log("--skip-launch：跳过启动，直接查找已存在的窗口")
+            try:
+                win = wait_for_window(cfg, overall_deadline)
+            except TimeoutError as exc:
+                log(str(exc), "ERROR")
+                return False, FAIL_WINDOW_NOT_FOUND
+            session = build_session(cfg, res, win)
+            if session is None:
+                last_reason = "连接/初始化失败"
+                log(f"[{time.strftime('%H:%M:%S')}] 第 {attempt} 次会话建立失败({last_reason})，计入重启兜底", "ERROR")
+                restarts += 1
+                continue
+
+        ctrl, tasker, sink, monitor, hwnd = session
+        # ★#23★ 主界面正向判定函数提前构造（原来在门控之后才建，重连后根本到不了那里）。
+        # 供本轮「直判」与 post_click_verify 三态判定共用，避免重复构造。
+        marker_hit_fn = make_marker_hit_fn(tasker, cfg)  # 内部 build_marker_params 已做空/缺文件硬守护
+
+        def _direct_confirm(when: str) -> bool:
+            """对当前帧直判一次主界面，绕开 sink.is_success 的 TitleScreenDetectedClick 门槛。
+
+            ★#25★ 不再设「点击前/未重连不直判」守护：二次运行 / --skip-launch / 残留窗口
+            使游戏已在主界面时（click_count=0 且 restarts=0），主界面无按钮可点、正常点击
+            流程救不回来，会一路空转到 FAIL_MAX_RESTARTS。复核已用真实判定器遍历 21 张
+            负样本（标题/污染/加载/纯色）证明模板本身零误命中，直判在每轮都执行是安全的。
+            """
+            try:
+                frame = ctrl.post_screencap().wait().get()
+            except Exception as exc:  # noqa: BLE001 - 截图失败不影响后续流程
+                log(f"主界面直判[{when}]截图失败（忽略）: {exc}", "WARN")
+                return False
+            if direct_marker_confirm(frame, cfg, marker_hit_fn, log_fn=log,
+                                     probe_fn=lambda f, tag: save_probe_frame(f, tag, log_fn=log)):
+                log(f"成功【{OK_MARKER}】：主界面模板直判命中[{when}]（非加载态），已确认进入游戏", "OK")
+                return True
+            return False
+
+        # ① 每轮 pipeline 之前（含 SESSION_LOST / 进程退出重连后的新一轮开头）：直达主界面立刻确认
+        if _direct_confirm("pipeline 前"):
+            return True, OK_MARKER
+
+        # ★#18★ 每次跑 pipeline 前强制置前（上次会话 SetForegroundWindow 一直被拒）
+        try:
+            force_foreground(hwnd)
+        except Exception as exc:  # noqa: BLE001
+            log(f"置前异常（继续）: {exc}", "WARN")
+        attempt_deadline = min(overall_deadline, time.monotonic() + attempt_cap)
+        log(f"第 {attempt} 次运行 pipeline（上次原因: {last_reason}）...")
+        sink.reset()
+        sink.set_targets(marker_node, success_node)
+        # ★#18★ 达到最大点击次数后禁用点击（仅在重跑时生效，不无限点击）
+        attempt_override = dict(override)
+        geometry_ok = True
+        if click_count < max_clicks:
+            # ★#18 几何守卫★ 只有截图目标尺寸收敛到模板校准几何(1280×720)才允许点；
+            # 未收敛则本轮禁用点击，避免把 1260 宽帧的识别框按 1280 坐标系点击出去。
+            geometry_ok, geo = wait_target_geometry(
+                ctrl, cfg,
+                timeout_sec=float(cfg["controller"].get("geometry_wait_sec", 15.0)),
+            )
+        if click_count >= max_clicks:
+            attempt_override["TitleScreenDetectedClick"] = {
+                **build_detection_params(cfg), "action": "DoNothing",
+            }
+            log(f"  #18: 已达最大点击次数 {max_clicks}，本次重跑禁用点击动作")
+        elif not geometry_ok:
+            attempt_override["TitleScreenDetectedClick"] = {
+                **build_detection_params(cfg), "action": "DoNothing",
+            }
+            log("  #18: 几何未收敛（截图目标 ≠ 1280×720），本轮禁用点击动作")
+        job = tasker.post_task(entry, attempt_override)
+        status = monitor_job(job, tasker, monitor, attempt_deadline, interval)
+        if sink.clicked:
+            click_count += 1
+            log(f"  #18: 本次点击发生，累计 {click_count}/{max_clicks}")
+
+        if status == FAIL_OVERALL_TIMEOUT:
+            log("运行期触发整体超时，已 post_stop()", "ERROR")
+            return False, FAIL_OVERALL_TIMEOUT
+
+        if status == FAIL_PROCESS_DIED:
+            ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            dur = monitor.alive_duration()
+            stability = ("启动未稳定(<60s，短动作窗口不足)" if dur < stable_alive
+                         else "本次曾稳定存活≥60s(短动作窗口充足)，退出属数分钟级静默自退")
+            last_reason = f"游戏进程中途退出@{ts} 连续存活={dur:.0f}s {stability}"
+            log(f"[{ts}] 检测到目标进程退出（非模板识别失败）。{last_reason}；"
+                f"保留日志与截图(debug/maafw.log、debug/on_error/、debug/screencap/)。", "ERROR")
+            try:
+                ctrl.post_screencap().wait()  # best effort 留证
+            except Exception:
+                pass
+            session = None  # 丢弃旧会话，下轮重新 launch + 发现窗口 + 连接
+            restarts += 1
+            # ★第 3 次仍在相同时间窗退出 → 确定性失败，停止重试并上报，不无限循环★
+            if start_count >= max_starts:
+                log(f"第 {start_count} 次(最后一次)启动仍在相同时间窗退出 → "
+                    f"判定确定性失败，停止重试并上报。", "ERROR")
+                return False, FAIL_DETERMINISTIC
+            # 退出后等 10~15s 再重启（等 conhost/UnityCrashHandler64 子进程退出、句柄释放）
+            log(f"等待 {restart_wait:.0f}s 后重启（等子进程退出/句柄释放）...", "WARN")
+            wait_end = min(overall_deadline, time.monotonic() + restart_wait)
+            while time.monotonic() < wait_end:
+                time.sleep(min(0.5, max(0.0, wait_end - time.monotonic())))
+            continue
+
+        job.wait()
+        try:
+            detail = job.get()
+            log(f"任务详情: {str(detail)[:300]}")
+        except Exception as exc:  # noqa: BLE001 - 取详情失败不影响成功判定
+            log(f"取任务详情失败（不影响判定）: {exc}", "WARN")
+
+        # ★#23 P1-2★ ② 门控之前再直判一次：覆盖「pipeline 跑完但 sink.is_success 门槛未满足」
+        # 的主界面帧。重连后直达主界面时 TitleScreenDetectedClick 不命中、is_success=False，
+        # 若没有这里，post_click_verify 永不调用、OK_MARKER 永久不可达（老毛病「进了游戏却判失败」）。
+        if _direct_confirm("门控前"):
+            return True, OK_MARKER
+
+        # 前置：pipeline 走到成功标志节点 + 进程存活（★#23★ 不再是 OK_MARKER 的唯一入口）
+        if not (sink.is_success(tasker) and monitor.alive()):
+            last_reason = "界面标志未命中（进程仍存活，不重启游戏，仅复用会话重跑）"
+            log(f"第 {attempt} 次未达成功标志（marker={marker_node} 命中="
+                f"{marker_node in sink.succeeded_recognitions}）；"
+                f"识别事件: {sink.events[-12:]}", "WARN")
+            # ★#21★ 失败路径也留一张判定时刻原图（pipeline 没走到 InGameSuccess 时同样要取证）
+            try:
+                save_probe_frame(ctrl.post_screencap().wait().get(), "fail_no_flag", log_fn=log)
+            except Exception as exc:  # noqa: BLE001
+                log(f"失败路径留图异常（忽略）: {exc}", "WARN")
+            if click_count >= max_clicks:
+                return False, FAIL_NOT_CONFIRMED
+            continue
+
+        # ★#21★ 判定时刻先留一张原图（无论后续结论如何，保证下次能拿到素材）
+        try:
+            save_probe_frame(ctrl.post_screencap().wait().get(), "verdict", log_fn=log)
+        except Exception as exc:  # noqa: BLE001
+            log(f"判定时刻留图异常（忽略）: {exc}", "WARN")
+
+        # ★#21★ 三态判定：点击后持续采样 20~30s，绝不因单帧「按钮消失」就下结论。
+        # marker_hit_fn 已在每轮开头提前构造（#23，供直判与此三态判定共用）。
+        verdict, why = post_click_verify(
+            cfg,
+            screencap_fn=lambda: ctrl.post_screencap().wait().get(),
+            is_alive_fn=monitor.alive,
+            button_visible_fn=make_button_visible_fn(tasker, cfg),
+            marker_hit_fn=marker_hit_fn,
+            probe_fn=lambda f, tag: save_probe_frame(f, tag, log_fn=log),
+            log_fn=log,
+            loading_seen_before=bool(sink.loading_seen_after_click),
+        )
+        log(f"点击后判定结论: {verdict} | {why}")
+
+        if verdict == "MARKER":
+            log(f"成功【{OK_MARKER}】：{why}（正向主界面模板命中，已确认进入游戏）", "OK")
+            return True, OK_MARKER
+
+        if verdict == "LEFT_TITLE":
+            # 疑似成功：按钮连续 20s 不见 + 非加载态 + 进程存活，但**没有**正向标志 →
+            # 不得当作成功返回（run 返回 False + 专用结果码，main() 用退出码 3 显式区分）。
+            log(f"疑似成功（未经正向标志确认）【{OK_DEGRADED_UNVERIFIED}】：{why}。"
+                f"★仅是推测：无主界面模板，无法确认真的进入了游戏；请核对取证留图 "
+                f"debug/screencap/in_game_probe_*_unverified.png★", "WARN")
+            return False, OK_DEGRADED_UNVERIFIED
+
+        if verdict == "SESSION_LOST":
+            last_reason = f"点击后窗口/进程消失（疑似客户端重启）: {why}"
+            log(f"[{time.strftime('%H:%M:%S')}] {last_reason} → 走重启兜底（不计入判定失败）", "WARN")
+            session = None
+            restarts += 1
+            if start_count >= max_starts:
+                return False, FAIL_PROCESS_DIED
+            continue
+
+        # STILL_TITLE / TIMEOUT：仍停在标题或无法确认
+        last_reason = f"点击后 {verdict}: {why}"
+        log(f"[{time.strftime('%H:%M:%S')}] {last_reason}；click_count={click_count}/{max_clicks}", "ERROR")
+        if click_count >= max_clicks:
+            return False, FAIL_NOT_CONFIRMED
+        continue
+
+    log(f"达到最大尝试上限，仍失败（最后原因: {last_reason}）。请查看 debug/on_error/ 留图。", "ERROR")
+    return False, FAIL_MAX_RESTARTS
+
+
+# --------------------------------------------------------------------------- #
+# 静态自测（--check）：绝不启动游戏、不点击真实窗口、不创建 Win32 控制器
+# --------------------------------------------------------------------------- #
+def _fake_win(name, cls, hwnd, visible=True, width=800, height=600):
+    return type("FakeWin", (), {
+        "hwnd": hwnd, "class_name": cls, "window_name": name,
+        "visible": visible, "width": width, "height": height,
+    })()
+
+
+def _validate_pipeline_json(path: Path) -> dict:
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _resolve_frame_path(name: str):
+    """把帧名解析成绝对路径：支持 artifacts 素材名与 debug 下的相对路径（vision/xx.jpg）。"""
+    p = Path(name)
+    if p.is_absolute():
+        return p
+    for base in (ARTIFACTS_DIR, DEBUG_DIR):
+        cand = base / name
+        if cand.is_file():
+            return cand
+    raise FileNotFoundError(f"找不到帧素材: {name}（已查 {ARTIFACTS_DIR} 与 {DEBUG_DIR}）")
+
+
+def _load_real_frame_bgr(name: str):
+    """读一张真实帧（PNG/JPG），按 720p 短边缩放，转 BGR 连续数组（与运行时截图同尺度）。
+
+    ★#18★ 支持直接读 debug/vision 下的真实运行帧（JPG），校准与 --check 才能用上实跑帧。
+    """
+    import numpy as np
+    from make_template import decode_image, area_resize_short_side  # tools/
+    rgb = decode_image(_resolve_frame_path(name))[:, :, :3]
+    scaled = area_resize_short_side(rgb)
+    return np.ascontiguousarray(scaled[:, :, ::-1])  # BGR
+
+
+def _make_static_tasker(frame_bgr, cfg: dict):
+    """构造离线 Tasker：CustomController(喂一张静态帧) + 真实 resource bundle + 注册自定义识别。
+
+    返回 (tasker, ctrl, cleanup_fn)。真实 bundle 保证用的是与实跑完全相同的 4 模板/roi/threshold，
+    不再用临时假 bundle、也不再用写死 lambda 自证识别能力。
+    """
+    import shutil
+    import tempfile
+    import numpy as np
+    from maa.controller import CustomController
+
+    class StaticController(CustomController):
+        def __init__(self, img):
+            self.img = img
+            self.clicks = []
+            super().__init__()
+
+        def connect(self): return True
+        def request_uuid(self): return "offline-static-720p"
+        def get_features(self): return 0
+        def start_app(self, intent): return True
+        def stop_app(self, intent): return True
+        def screencap(self): return self.img
+        def click(self, x, y):
+            self.clicks.append((int(x), int(y)))
+            return True
+        def swipe(self, *a): return True
+        def touch_down(self, *a): return True
+        def touch_move(self, *a): return True
+        def touch_up(self, *a): return True
+        def click_key(self, *a): return True
+        def input_text(self, *a): return True
+        def key_down(self, *a): return True
+        def key_up(self, *a): return True
+
+    tmp = Path(tempfile.mkdtemp(prefix="maa_offline_"))
+    Toolkit.init_option(str(tmp), {"logging": False, "stdout_level": 0})
+    ctrl = StaticController(frame_bgr)
+    ctrl.set_screenshot_use_raw_size(True)  # 避免二次缩放，坐标与裁剪一致
+    cj = ctrl.post_connection(); cj.wait()
+    res = Resource()
+    res.register_custom_recognition(CUSTOM_RECO_NAME, LoadingScreenReco())
+    rj = res.post_bundle(str(RESOURCE_DIR)); rj.wait()  # ★真实 bundle★
+    if not rj.succeeded:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise RuntimeError("真实 resource bundle post_bundle 失败（检查 model/ocr 目录）")
+    tasker = Tasker()
+    tasker.bind(res, ctrl)
+    if not tasker.inited:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise RuntimeError("离线 Tasker 初始化失败")
+    cleanup = lambda: shutil.rmtree(tmp, ignore_errors=True)
+    return tasker, ctrl, cleanup
+
+
+def offline_template_match_check(cfg: dict) -> tuple[bool, str]:
+    """★自匹配管道自检★ 喂 1280×720 真实判定帧（模板 v8 的裁剪母图）跑最小 pipeline。
+
+    ⚠️ 这是自匹配：NCC=1.0 必然命中、box 必然是裁剪框，只证明真实 bundle 能加载 + 识别/点击链路
+    能跑通，**完全不证明真实帧识别能力**。真实帧识别能力由 real_frame_button_visibility_check()
+    用真实 make_button_visible_fn + 多张独立真实帧覆盖（--check [16]）。
+    ★#18★ 母图从旧的 860 宽 artifacts 帧改为 1280 宽真实 screencap：模板几何 1280×720，
+    喂 860 帧时按钮坐标不同、crop 必然落空（旧版本正是因此假失败）。
+    """
+    import numpy as np
+
+    SRC = "screencap/2026.11.07-02.11.27.757_InGameSuccess.png"
+    try:
+        bgr = _load_real_frame_bgr(SRC)
+    except FileNotFoundError:
+        return False, f"缺少素材: {SRC}"
+    tcfg = cfg["recognition"]["template"]
+    crop = tcfg["crop"]  # [468,576,793,599]
+
+    try:
+        tasker, ctrl, cleanup = _make_static_tasker(bgr, cfg)
+    except Exception as exc:
+        return False, f"离线 Tasker 构造失败: {exc}"
+
+    try:
+        # 最小 pipeline（override 注入）：用与实跑同一套 8 模板数组 + roi + threshold 识别按钮并点击
+        ov = {
+            "OfflineEntry": {"action": "DoNothing", "next": ["OfflineFind"],
+                             "timeout": 5000, "rate_limit": 10},
+            "OfflineFind": {**build_detection_params(cfg), "action": "Click",
+                            "target": True, "next": ["OfflineDone"]},
+            "OfflineDone": {"action": "StopTask"},
+        }
+        job = tasker.post_task("OfflineEntry", ov).wait()
+
+        coord = ctrl.clicks[0] if ctrl.clicks else None
+        x0, y0, x1, y1 = crop
+        in_box = bool(coord) and (x0 <= coord[0] <= x1 and y0 <= coord[1] <= y1)
+
+        # 加载态合成帧不误命中（同一套识别参数）
+        frame_checks = []
+        for name, val in [("白屏", 250), ("黑屏", 5), ("灰屏纯色", 128)]:
+            lf = np.full_like(bgr, val)
+            p = build_detection_params(cfg)
+            rj = tasker.post_recognition(
+                JRecognitionType.TemplateMatch,
+                JTemplateMatch(template=list(p["template"]),
+                               threshold=[p["threshold"]], method=p["method"],
+                               roi=tuple(p["roi"]) if p.get("roi") else (0, 0, 0, 0)),
+                lf,
+            )
+            rj.wait()
+            rd = rj.get()
+            nid = rd.node_id_list[0] if (rd and getattr(rd, "node_id_list", None)) else None
+            nd = tasker.get_node_detail(nid) if nid else None
+            hit = bool(getattr(getattr(nd, "recognition", None), "hit", False))
+            frame_checks.append(f"{name}:hit={hit}")
+        loading_no_hit = all("hit=False" in x for x in frame_checks)
+
+        ok = bool(job.succeeded and ctrl.clicks and in_box and loading_no_hit)
+        detail = (f"真实 bundle 加载 + 识别/点击链路跑通; 点击坐标={coord} 落在按钮框 {crop} 内={in_box} "
+                  f"(★自匹配必然值，不作真实帧识别能力证据★); task_succeeded={job.succeeded}; "
+                  f"| 加载态合成帧不误命中[{' '.join(frame_checks)}]={'OK' if loading_no_hit else 'FAIL'}")
+        Tasker.set_log_dir(str(DEBUG_DIR))
+        return ok, detail
+    finally:
+        cleanup()
+
+
+def real_frame_button_visibility_check(cfg: dict) -> tuple[bool, str]:
+    """★#18 真实帧断言★ 用真实的 make_button_visible_fn（非写死 lambda）在真实 1280×720 帧上判定。
+
+    - 「按钮可见」真实帧(1280×720，含一张白到发光的标题帧) → 期望 True，并输出 NCC/命中 box
+    - 「加载/过渡」真实帧(黑屏 / 白色警告页 / 白色公告页) + 纯白/黑/灰 → 期望 False
+    实测(NCC 8 模板取最大)：正样本 leave-one-out min=0.676，负样本 max=0.282，阈值 0.5 两侧有余量。
+    ★该函数只证明『按钮能被定位』，不证明『按钮不可见=进入游戏』★——后者由 run() 的
+    『点击后观察到加载态』守卫负责，禁止用本函数反推成功。
+    """
+    import numpy as np
+    visible = cfg["recognition"]["calibration"]["source_frames_visible"]
+    loading = cfg["recognition"]["calibration"]["source_frames_loading"]
+
+    first = _load_real_frame_bgr(visible[0])
+    try:
+        tasker, ctrl, cleanup = _make_static_tasker(first, cfg)
+    except Exception as exc:
+        return False, f"离线 Tasker 构造失败: {exc}"
+    try:
+        p = build_detection_params(cfg)
+        reco_param = JTemplateMatch(template=list(p["template"]),
+                                    threshold=[p["threshold"]], method=p["method"],
+                                    roi=tuple(p["roi"]) if p.get("roi") else (0, 0, 0, 0))
+        visible_fn = make_button_visible_fn(tasker, cfg)  # ★真实函数★
+
+        def probe(frame):
+            j = tasker.post_recognition(JRecognitionType.TemplateMatch, reco_param,
+                                        np.ascontiguousarray(frame)); j.wait()
+            d = j.get()
+            rd = tasker.get_node_detail(d.node_id_list[0]).recognition
+            allr = getattr(rd, "all_results", []) or []
+            ncc = max([r.score for r in allr], default=None)
+            return bool(rd.hit), ncc, getattr(rd, "box", None)
+
+        lines = []
+        ok = True
+        v_hit = 0
+        for n in visible:
+            hit, ncc, box = probe(_load_real_frame_bgr(n))
+            vis = visible_fn(_load_real_frame_bgr(n))  # 真实 make_button_visible_fn
+            v_hit += int(vis)
+            lines.append(f"{n}:button_visible={vis},NCC={None if ncc is None else round(ncc,4)},box={box}")
+            if not vis:
+                ok = False
+        l_hit = 0
+        for n in loading:
+            vis = visible_fn(_load_real_frame_bgr(n))
+            l_hit += int(vis)
+            lines.append(f"{n}:button_visible={vis}")
+            if vis:
+                ok = False
+        for name, val in [("纯白", 250), ("纯黑", 5), ("纯灰", 128)]:
+            vis = visible_fn(np.full_like(first, val))
+            l_hit += int(vis)
+            lines.append(f"{name}:button_visible={vis}")
+            if vis:
+                ok = False
+        Tasker.set_log_dir(str(DEBUG_DIR))
+        detail = (f"可见帧 button_visible=True {v_hit}/{len(visible)}; "
+                  f"加载态+纯色 button_visible=False {len(loading) + 3 - l_hit}/{len(loading) + 3} "
+                  f"| " + " ; ".join(lines))
+        return ok, detail
+    finally:
+        cleanup()
+
+
+def static_self_check(cfg: dict) -> bool:
+    print("=" * 70)
+    print("静态自测 --check（不启动游戏 / 不点击真实窗口 / 不创建 Win32 控制器）")
+    print("=" * 70)
+    failures: list[str] = []
+
+    # 1) import + 版本
+    try:
+        print(f"[1] Library.version() = {Library.version()}")
+        from maa import controller, toolkit, resource, tasker  # noqa: F401
+        print("    maa.* 关键模块 import OK")
+    except Exception as exc:
+        failures.append(f"import 失败: {exc}")
+
+    # 2) inspect.signature 复核 Win32Controller：第一参数必须是 hWnd（故用位置参数）
+    try:
+        sig = inspect.signature(Win32Controller.__init__)
+        params = list(sig.parameters)
+        first = params[1] if len(params) > 1 else None
+        print(f"[2] Win32Controller.__init__{sig}")
+        print(f"    第一个窗口参数名 = {first!r}（binding 为 hWnd，与 demo 的 hwnd= 冲突 → 用位置参数）")
+        if first != "hWnd":
+            failures.append(f"第一个窗口参数名不是 hWnd，而是 {first!r}")
+    except Exception as exc:
+        failures.append(f"inspect.signature 失败: {exc}")
+
+    # 3) 控制器枚举解析（默认 Foreground + Seize）+ 输入方式一行可切
+    try:
+        s, m, k = resolve_controller_methods(cfg)
+        print(f"[3] controller 枚举解析 OK: screencap={s}({cfg['controller']['screencap']}) "
+              f"mouse={m}({cfg['controller']['mouse']}) keyboard={k}({cfg['controller']['keyboard']})")
+        # ★#18★ 输入方式备选必须都能解析（Seize 需前台；PostMessageWithCursorPos/PostMessage 不需前台）
+        alts = ["Seize", "PostMessageWithCursorPos", "PostMessage"]
+        resolved = {n: int(getattr(MaaWin32InputMethodEnum, n)) for n in alts}
+        assert resolved == {"Seize": 1, "PostMessageWithCursorPos": 64, "PostMessage": 4}, resolved
+        print(f"    输入方式一行可切（改 settings.controller.mouse/keyboard）: {resolved}；"
+              f"当前={cfg['controller']['mouse']}（Seize 需前台；若置前后仍点不动由 #5 切 64/4）")
+    except Exception as exc:
+        failures.append(f"枚举解析失败: {exc}")
+
+    # 4) pipeline JSON 语法 + 节点引用完整性
+    try:
+        for p in sorted(PIPELINE_DIR.glob("*.json")):
+            data = _validate_pipeline_json(p)
+            print(f"[4] pipeline JSON 语法 OK: {p.name}（{len(data)} 个节点）")
+        _validate_pipeline_json(RESOURCE_DIR / "default_pipeline.json")
+        print("    default_pipeline.json 语法 OK")
+        merged: dict = {}
+        for p in PIPELINE_DIR.glob("*.json"):
+            merged.update(_validate_pipeline_json(p))
+        known = set(merged)
+        missing: list[str] = []
+        for node, body in merged.items():
+            refs: list = []
+            for key in ("next", "on_error"):
+                v = body.get(key, [])
+                refs += v if isinstance(v, list) else [v]
+            for r in refs:
+                if not isinstance(r, str):
+                    continue
+                clean = r.split("]", 1)[1] if r.startswith("[") else r
+                if clean not in known:
+                    missing.append(f"{node} -> {r}")
+        if missing:
+            failures.append(f"pipeline 悬空引用: {missing}")
+        else:
+            print(f"    next / on_error 引用完整性 OK（{len(known)} 节点，含 [JumpBack] 前缀剥离）")
+    except Exception as exc:
+        failures.append(f"pipeline JSON 校验失败: {exc}")
+
+    # 5) 资源目录结构 + 8 模板 PNG（真实 1280×720 帧裁的 325×23 纯文字区）+ OCR 目录约束
+    try:
+        for d in [RESOURCE_DIR / "pipeline", IMAGE_DIR, BASE_DIR / "config", DEBUG_DIR]:
+            assert d.is_dir(), f"缺少目录 {d}"
+        tcfg = cfg["recognition"]["template"]
+        tpls = tcfg["files"]
+        assert len(tpls) >= 2, "P0-0 需要多模板数组（跨立绘轮播稳健）"
+        c0, cy0, c1, cy1 = tcfg["crop"]
+        want = (c1 - c0, cy1 - cy0)
+        assert tcfg["roi"][0] <= c0 and tcfg["roi"][1] <= cy0 and \
+            tcfg["roi"][0] + tcfg["roi"][2] >= c1 and tcfg["roi"][1] + tcfg["roi"][3] >= cy1, \
+            f"crop {tcfg['crop']} 必须完整落在 roi {tcfg['roi']} 内（否则永远定位不到）"
+        dims = []
+        for fn in tpls:
+            tpl = IMAGE_DIR / fn
+            assert tpl.is_file(), f"缺少模板 {tpl}"
+            with tpl.open("rb") as f:
+                head = f.read(33)
+            assert head[:8] == b"\x89PNG\r\n\x1a\n", f"{fn} 不是合法 PNG"
+            dims.append(struct.unpack(">II", head[16:24]))
+        assert all(d == want for d in dims), f"模板尺寸应与 crop 一致 {want}，实际 {dims}"
+        print(f"[5] 资源目录结构 OK；{len(tpls)} 张模板均 {want[0]}x{want[1]} PNG "
+              f"（1280x720 真实帧 crop={tcfg['crop']} 纯文字区，且落在 roi 内）")
+        # ★OCR 目录约束★：缺三件套时不得存在 model/ocr（否则 post_bundle 整体失败）
+        ocr_dir = RESOURCE_DIR / "model" / "ocr"
+        has_models = all((ocr_dir / n).exists() for n in ["det.onnx", "rec.onnx", "keys.txt"])
+        if ocr_dir.is_dir() and not has_models:
+            failures.append("model/ocr 目录存在但缺三件套 → post_bundle 会失败（应移除该空目录）")
+        else:
+            print(f"    OCR 目录约束 OK: model/ocr {'缺（默认 template，正确）' if not ocr_dir.is_dir() else '存在且三件套齐全'}")
+        # P1-7: README.md 真实存在（reviewer 报悬空引用）
+        assert (BASE_DIR / "README.md").is_file(), "agent/README.md 缺失（P1-7 悬空引用）"
+        print("    P1-7: agent/README.md 真实存在 OK")
+    except Exception as exc:
+        failures.append(f"资源结构校验失败: {exc}")
+
+    # 6) 窗口过滤单元检查（含排除 IME 隐藏窗 / 工具窗 / 可见非 0×0）
+    try:
+        wcfg = cfg["window"]
+        wins = [
+            _fake_win("iM@S SCSP Tools By chinosk", "ConsoleWindowClass", 11),
+            _fake_win("WorkBuddy - 某文档", "Chrome_WidgetWin_1", 22),
+            _fake_win("MSCTFIME UI", "MSCTFIME UI", 33, visible=False, width=0, height=0),
+            _fake_win("Default IME", "Default IME", 44, visible=False, width=0, height=0),
+            _fake_win("imasscprism", "UnityWndClass", 55),
+            _fake_win("一个无关窗口", "", 66),
+        ]
+        usable = lambda h: {
+            11: True, 22: True, 33: False, 44: False, 55: True, 66: True
+        }.get(h, True)
+        got = pick_window(wins, wcfg, usable=usable)
+        assert got is not None and got.window_name == "imasscprism", "未正确选中目标窗口"
+        assert pick_window([wins[0]], wcfg, usable=usable) is None, "mod 工具窗未被排除"
+        assert pick_window([wins[1]], wcfg, usable=usable) is None, "WorkBuddy 窗口未被排除"
+        assert pick_window([wins[2]], wcfg, usable=usable) is None, "MSCTFIME UI 未被排除"
+        assert pick_window([wins[3]], wcfg, usable=usable) is None, "Default IME 未被排除"
+        assert pick_window([wins[5]], wcfg, usable=usable) is None, "无关窗口被误选"
+        # 目标窗口本身若 0×0/不可见也应被排除
+        hidden_target = _fake_win("imasscprism", "UnityWndClass", 77, visible=False, width=0, height=0)
+        assert pick_window([hidden_target], wcfg, usable=lambda h: False) is None, "隐藏目标窗未被排除"
+        print(f"[6] 窗口过滤单元检查 OK: 命中 hwnd={_hwnd_int(got.hwnd)} class={got.class_name!r}；"
+              f"工具窗/IME/WorkBuddy/隐藏窗均已排除")
+        wcfg2 = dict(wcfg); wcfg2["class_name_fallback"] = "UnityWndClass"
+        assert pick_window([_fake_win("别的名字", "UnityWndClass", 88)], wcfg2, usable=usable) is not None
+        print("    class_name_fallback 兜底分支 OK")
+    except Exception as exc:
+        failures.append(f"窗口过滤单元检查失败: {exc}")
+
+    # 7) 已拍板开关 / 单一决策点 / 可插拔接口 / pipeline 过渡态防线结构
+    try:
+        entry, marker, success = select_task(cfg)
+        assert cfg["flow"]["click_to_start"] is True, "click_to_start 必须为 true"
+        assert cfg["launch"]["mode"] == "lnk", "launch.mode 必须锁定 lnk"
+        assert "dmmplayer" not in cfg["launch"], "launch 段不应残留 dmmplayer 配置"
+        assert entry == "LoginAndStart", "默认必须走点击进入游戏的 flow"
+        print("[7] 用户已拍板（逐项断言）:")
+        print(f"    flow.click_to_start = True  (决策点 select_task → entry={entry})")
+        print(f"    launch.mode = 'lnk' 固定，launch 段无 dmmplayer 配置（单一 launch_game）")
+        print(f"    据此选择: marker={marker} success={success}")
+        ov = build_pipeline_override(cfg)
+        assert "TitleScreenDetectedClick" in ov and "InGameSuccess" in ov
+        assert ov["InGameSuccess"]["inverse"] is True, "默认应inverse判定(未填主界面模板)"
+        # ★#18★ 点击目标不再是 target:true 的随机点，而是 Custom/ClickCenter 精确点框中心
+        assert "target" not in ov["TitleScreenDetectedClick"], \
+            "build_pipeline_override 不得注入 target（#18 起用 ClickCenter 点框中心，避免 rand_point 落框沿）"
+        # ★轮播★ override 不得注入全图 wait_freezes
+        assert "pre_wait_freezes" not in ov["InGameSuccess"] and \
+               "post_wait_freezes" not in ov["InGameSuccess"], "不得注入全图 wait_freezes（立绘轮播）"
+        # ★第5项补正★ pipeline 过渡态防线结构确认
+        pdata = _validate_pipeline_json(PIPELINE_DIR / "login.json")
+        click_node = pdata["TitleScreenDetectedClick"]
+        assert click_node.get("action") == "Custom" and click_node.get("custom_action") == "ClickCenter", \
+            "点击须走 Custom/ClickCenter（点识别框中心）"
+        assert "target" not in click_node, "ClickCenter 方案下不得再写 target（会叠加随机偏移）"
+        assert "pre_wait_freezes" not in click_node, "点击节点不得用全图 wait_freezes"
+        assert "pre_wait_freezes" not in pdata["InGameSuccess"], "InGameSuccess 不得用全图 wait_freezes"
+        assert "post_wait_freezes" not in pdata["InGameSuccess"], "InGameSuccess 不得用全图 post_wait_freezes"
+        assert pdata["WaitInGame"]["next"][0] == "[JumpBack]HandleLoadingScreen", \
+            "加载态回跳必须放在 WaitInGame.next 第一位，优先于 inverse 成功判定"
+        assert click_node["post_delay"] >= 1500, "点击后需 post_delay 1500ms"
+        assert pdata["HandleLoadingScreen"]["custom_recognition"] == "LoadingScreenReco"
+        assert set(pdata["HandleLoadingScreen"]["custom_recognition_param"]) == \
+            {"black_mean_max", "white_mean_min", "white_std_max", "std_min",
+             "loading_template", "loading_template_threshold", "loading_template_roi"}, \
+            "加载态须覆盖 黑/纯白(低方差)/低方差 + Now Loading 模板 四类参数"
+        assert pdata["HandleLoadingScreen"]["custom_recognition_param"]["white_std_max"] == \
+            cfg["recognition"]["loading_frame"]["white_std_max"], "pipeline 与配置的白屏方差阈值须一致"
+        assert pdata["HandleLoadingScreen"]["custom_recognition_param"]["loading_template"] == \
+            cfg["recognition"]["loading_template"]["file"], "pipeline 与配置的加载页模板须一致"
+        assert OK_DEGRADED_UNVERIFIED != OK_MARKER and "UNVERIFIED" in OK_DEGRADED_UNVERIFIED, \
+            "疑似成功须有独立结果码（且名字里带 UNVERIFIED，避免被当成成功）"
+        # ★P0-0★ 校准参数一致性：build_detection_params 与 login.json 三个 TemplateMatch
+        # 节点、以及 make_button_visible_fn 必须共用同一套 4 模板数组 + roi + threshold
+        dp = build_detection_params(cfg)
+        assert isinstance(dp["template"], list) and len(dp["template"]) >= 2, "须为多模板数组"
+        assert dp["roi"] == cfg["recognition"]["template"]["roi"], "roi 须来自校准配置"
+        for node in ["TitleScreenDetectedClick", "TitleScreenDetected", "InGameSuccess"]:
+            assert pdata[node]["template"] == dp["template"], f"{node} 的 template 须与 build_detection_params 一致"
+            assert pdata[node]["roi"] == dp["roi"], f"{node} 的 roi 须与校准一致"
+            assert pdata[node]["threshold"] == dp["threshold"], f"{node} 的 threshold 须与校准一致"
+        assert ov["TitleScreenDetectedClick"]["template"] == dp["template"], "override 的 template 须与校准一致"
+        print(f"    ★P0-0 校准一致性 OK: {len(dp['template'])} 模板数组 + roi={dp['roi']} + "
+              f"threshold={dp['threshold']}，三个节点/override/button_visible_fn 同源 build_detection_params")
+        print(f"    build_pipeline_override 生成 {len(ov)} 项覆盖；InGameSuccess inverse="
+              f"{ov['InGameSuccess']['inverse']}；点击走 ClickCenter、无 target 随机偏移、无全图 wait_freezes 注入")
+        print("    过渡态防线 OK: WaitInGame.next[0]=[JumpBack]HandleLoadingScreen、"
+              "post_delay=1500ms、LoadingScreenReco 覆盖黑/纯白低方差/低方差、"
+              f"三态结果码 {OK_MARKER}/{OK_DEGRADED_UNVERIFIED}/{FAIL_NOT_CONFIRMED} 互斥")
+        # ★#23 P1-1★ 三数组配置合法 + Python 侧正向判定可用 + override 不再含孤立死节点
+        rec = cfg["recognition"]
+        assert isinstance(rec["in_game_marker_template"], list) and \
+               len(rec["in_game_marker_template"]) == 3, "模板须为 3 元素数组（字符串或数组接口均可）"
+        assert rec["in_game_marker_threshold"] == [0.55, 0.75, 0.6] and \
+               len(rec["in_game_marker_roi"]) == 3, "每模板各自阈值/roi 数组须与模板等长且合法"
+        spec = build_marker_params(cfg)
+        assert spec is not None and spec["template"] == rec["in_game_marker_template"], \
+            "build_marker_params 须与配置一致"
+        assert spec["threshold"] == [0.55, 0.75, 0.6] and \
+               spec["roi"] == rec["in_game_marker_roi"], "每模板各自阈值/roi 须来自校准配置"
+        assert ov["InGameSuccess"]["inverse"] is True, \
+            "InGameSuccess 必须保持 inverse（离开标题前置信号），切正向会让 exit 3 不可达"
+        assert not any(k.startswith("InGameMarker_") for k in ov), \
+            "build_pipeline_override 不得生成孤立死节点 InGameMarker_*（#23 P1-1 已删除）"
+        assert make_marker_hit_fn(None, cfg) is not None, \
+            "3 模板有效时 Python 侧正向判定函数必须可用（权威判定不在 pipeline 里）"
+        print(f"    ★#23 主界面模板数组 OK★: 3 模板各自 roi/threshold 配置合法、"
+              f"make_marker_hit_fn 可用；override 无 InGameMarker_* 死节点；"
+              f"InGameSuccess 保持 inverse=true（三态完整）")
+    except Exception as exc:
+        failures.append(f"开关/决策点检查失败: {exc}")
+
+    # 8) pipeline_override 序列化
+    try:
+        json.dumps(build_pipeline_override(cfg), ensure_ascii=False)
+        print("[8] pipeline_override 可被 json.dumps 序列化 OK")
+    except Exception as exc:
+        failures.append(f"override 序列化失败: {exc}")
+
+    # 9) 权限自检：报告宿主状态与「非管理员时的提示文案」
+    try:
+        self_elev = is_self_elevated()
+        print(f"[9] 权限自检: 当前宿主 ELEVATED={self_elev}（实跑前置 require_elevation 会据此拒绝/放行）")
+        print("    非管理员时输出的中文提示文案（ELEVATION_HINT）:")
+        for ln in ELEVATION_HINT.strip().splitlines():
+            print("      | " + ln)
+        print("    不自行弹 UAC / 不自行 runas；--check 不因非管理员而失败")
+    except Exception as exc:
+        failures.append(f"权限自检文案检查失败: {exc}")
+
+    # 10) ★自匹配管道自检★（喂的是模板裁剪母图；DbgController 不可用 → CustomController 静态图）
+    try:
+        import maa
+        dbg_dll = Path(maa.__file__).parent / "bin" / "MaaDbgControlUnit.dll"
+        custom_dll = Path(maa.__file__).parent / "bin" / "MaaCustomControlUnit.dll"
+        print("[10] ★自匹配管道自检★（喂 debug/screencap/02.11.27.757_InGameSuccess.png = 模板 v8 的裁剪母图，真实 bundle）")
+        print("     ⚠️ 这是自匹配：NCC=1.0 必然命中、box 必然是裁剪框，只证明真实 bundle 能加载 +")
+        print("        识别/点击链路跑通，★不证明真实帧识别能力★。真实帧能力由 [16] 真实帧断言覆盖。")
+        print(f"     DbgController 所需 MaaDbgControlUnit.dll 存在={dbg_dll.exists()} → wheel 未随附、不可用")
+        print(f"     MaaCustomControlUnit.dll 存在={custom_dll.exists()} → 用 CustomController 喂静态图跑通链路")
+        ok, detail = offline_template_match_check(cfg)
+        print(f"     管道自检结果: {'跑通' if ok else '未跑通'} | {detail}")
+        if not ok:
+            failures.append(f"自匹配管道自检失败: {detail}")
+    except Exception as exc:
+        failures.append(f"自匹配管道自检异常: {exc}")
+
+    # 11) 加载态识别单测（黑/白/纯色/正常标题画面）
+    try:
+        import numpy as np
+        from make_template import decode_png as _dec
+        lf = cfg["recognition"]["loading_frame"]
+        b, w, s = lf["black_mean_max"], lf["white_mean_min"], lf["std_min"]
+        title = _dec(ARTIFACTS_DIR / "02-login-window-720p.png")[:, :, :3]
+        cases = [
+            ("白屏", np.full((720, 860, 3), 250, np.uint8), True),
+            ("黑屏", np.full((720, 860, 3), 5, np.uint8), True),
+            ("灰屏纯色", np.full((720, 860, 3), 128, np.uint8), True),
+            ("标题画面", title, False),
+        ]
+        for name, frame, expect in cases:
+            got = is_loading_frame(frame, b, w, s)
+            assert got == expect, f"{name} 期望 is_loading={expect} 得到 {got}"
+            print(f"      {name}: is_loading={got} (mean={frame.mean():.0f} std={frame.std():.0f})")
+        print("[11] 加载态识别单测 OK：黑/白/低方差纯色三态全命中，标题画面不误判（黑白两态都覆盖）")
+    except Exception as exc:
+        failures.append(f"加载态识别单测失败: {exc}")
+
+    # 12) 连续稳定复检逻辑单测（虚拟时钟 + 合成帧序列，不启动游戏、不点真实窗口）
+    try:
+        import numpy as np
+        rng = np.random.default_rng(0)
+        game = rng.integers(0, 256, (720, 860, 3), dtype=np.uint8)  # 非加载态、有纹理
+        white = np.full((720, 860, 3), 250, np.uint8)
+        black = np.full((720, 860, 3), 5, np.uint8)
+        nop = lambda *a, **k: None
+
+        # 12a 加载态(白→黑)之后连续稳定 → 必须累计满 5~10s 才成功
+        clock = {"t": 0.0}
+        seq = [white, white, black, black] + [game] * 40
+        idx = {"i": 0}
+        def cap():
+            f = seq[min(idx["i"], len(seq) - 1)]
+            idx["i"] += 1
+            return f
+        ok, why = confirm_in_game_stable(
+            cfg, screencap_fn=cap, is_alive_fn=lambda: True,
+            button_visible_fn=lambda f: False, log_fn=nop,
+            now_fn=lambda: clock["t"], sleep_fn=lambda s: clock.__setitem__("t", clock["t"] + s))
+        assert ok and "连续稳定" in why, f"加载态后应能稳定通过: {ok} {why}"
+        assert clock["t"] >= cfg["flow"]["in_game_stable_sec"], "未累计满连续稳定时长就判成功"
+        print(f"      [12a] 白屏→黑屏→稳定: PASS（{why}）")
+
+        # 12b 加载态持续 → 不得误报成功（裸 inverse 会在此误命中）
+        c2 = {"t": 0.0}
+        ok2, why2 = confirm_in_game_stable(
+            cfg, screencap_fn=lambda: white, is_alive_fn=lambda: True,
+            button_visible_fn=lambda f: False, log_fn=nop,
+            now_fn=lambda: c2["t"], sleep_fn=lambda s: c2.__setitem__("t", c2["t"] + s))
+        assert not ok2 and "超时" in why2, f"加载态持续应超时失败: {ok2} {why2}"
+        print(f"      [12b] 白屏加载态持续: 正确超时失败（{why2}）")
+
+        # 12c 按钮始终可见 → 不得判成功
+        c3 = {"t": 0.0}
+        ok3, why3 = confirm_in_game_stable(
+            cfg, screencap_fn=lambda: game, is_alive_fn=lambda: True,
+            button_visible_fn=lambda f: True, log_fn=nop,
+            now_fn=lambda: c3["t"], sleep_fn=lambda s: c3.__setitem__("t", c3["t"] + s))
+        assert not ok3, "按钮一直可见不应成功"
+        print(f"      [12c] 按钮始终可见: 正确不判成功（{why3}）")
+
+        # 12d 进程退出 → 立即失败
+        ok4, why4 = confirm_in_game_stable(
+            cfg, screencap_fn=lambda: game, is_alive_fn=lambda: False,
+            button_visible_fn=lambda f: False, log_fn=nop,
+            now_fn=lambda: 0.0, sleep_fn=lambda s: None)
+        assert not ok4 and "进程退出" in why4
+        print(f"      [12d] 进程退出: 正确失败（{why4}）")
+        print("[12] 连续稳定复检逻辑单测 OK（4 例全过：加载态/按钮可见/进程退出均会重置或拒绝）")
+    except Exception as exc:
+        failures.append(f"连续稳定复检单测失败: {exc}")
+
+    # 13) 兜底参数按 06-diagnosis.md §5 第 4 条校准
+    try:
+        f, l = cfg["flow"], cfg["launch"]
+        assert 2 <= l["window_poll_interval_sec"] <= 3, "轮询间隔须 2~3s"
+        assert l["window_poll_timeout_sec"] == 20, "启动确认超时须 20s（覆盖约 10s 加载）"
+        assert 2 <= f["process_check_interval_sec"] <= 3, "进程轮询须 2~3s"
+        assert f["stable_alive_sec"] >= 60, "连续存活≥60s 判本次启动可用"
+        assert 10 <= f["restart_wait_sec"] <= 15, "退出后等 10~15s 再重启"
+        assert f["max_restarts"] == 2, "最多重启 2 次（合计 3 次启动）"
+        assert 300 <= f["start_rate_window_sec"] <= 600, "5~10 分钟限流窗口"
+        assert f["max_starts_per_window"] == 3, "窗口内不超过 3 次启动"
+        assert 5 <= f["in_game_stable_sec"] <= 10, "连续稳定 5~10s"
+        assert FAIL_DETERMINISTIC and FAIL_STABLE_TIMEOUT, "确定性失败/稳定超时须有明确失败码"
+        print("[13] 兜底参数(§5-4)校准 OK: "
+              f"轮询={l['window_poll_interval_sec']}s/{f['process_check_interval_sec']}s "
+              f"启动确认={l['window_poll_timeout_sec']}s 连续存活≥{f['stable_alive_sec']:.0f}s(仅观测口径) "
+              f"退出后等{f['restart_wait_sec']:.0f}s 最多重启{f['max_restarts']}次(合计3次启动) "
+              f"{int(f['start_rate_window_sec'])}s窗口≤{f['max_starts_per_window']}次 "
+              f"连续稳定{f['in_game_stable_sec']:.0f}s | 明确失败码 {FAIL_DETERMINISTIC}/{FAIL_STABLE_TIMEOUT}")
+        print("     注明：60s 仅作重启决策/确定性失败标注的观测口径，非登录前置、非长期保活；"
+              "不写令牌刷新逻辑")
+    except Exception as exc:
+        failures.append(f"兜底参数校准检查失败: {exc}")
+
+    # 14) ★P0 守护★ 真实 resource bundle 必须能 post_bundle 成功
+    # （#3 遗留隐藏缺陷：空 model/ocr 目录会让整个 bundle 加载失败，实跑必然 FAIL_RESOURCE）
+    try:
+        import tempfile
+        from maa.resource import Resource as _R
+        Toolkit.init_option(str(Path(tempfile.mkdtemp())), {"logging": False, "stdout_level": 0})
+        r = _R()
+        r.register_custom_recognition(CUSTOM_RECO_NAME, LoadingScreenReco())
+        j = r.post_bundle(str(RESOURCE_DIR)); j.wait()
+        assert j.succeeded, "真实 resource bundle post_bundle 失败（检查 model/ocr 空目录）"
+        Tasker.set_log_dir(str(DEBUG_DIR))  # 恢复全局日志目录
+        print("[14] ★真实 bundle post_bundle 成功★（P0 守护：model/ocr 空目录缺陷已消除，实跑不会 FAIL_RESOURCE）")
+    except Exception as exc:
+        failures.append(f"真实 bundle 加载检查失败: {exc}")
+
+    # 16) ★P0-0 真实帧断言★ 用真实 make_button_visible_fn + 多张独立真实帧（非写死 lambda）
+    try:
+        ok, detail = real_frame_button_visibility_check(cfg)
+        print("[16] ★真实帧 button_visible 断言★（真实 make_button_visible_fn，非合成/写死 lambda）")
+        print(f"     {detail}")
+        if not ok:
+            failures.append(f"真实帧 button_visible 断言失败: {detail}")
+    except Exception as exc:
+        failures.append(f"真实帧 button_visible 断言异常: {exc}")
+
+    # 17) 三态加载阈值在真实帧上的验证（★#18：白屏必须带低方差，亮标题帧不得被判加载★）
+    try:
+        import numpy as np
+        lf = cfg["recognition"]["loading_frame"]
+        b, w, s, ws = (lf["black_mean_max"], lf["white_mean_min"],
+                       lf["std_min"], lf["white_std_max"])
+        cases = [
+            # (名称, 帧, 期望 is_loading, 说明)
+            ("黑屏过渡帧", _load_real_frame_bgr("vision/2026.11.07-02.10.16.166_HandleLoadingScreen_400000021.jpg"), True, "mean 2.8/std 16.0"),
+            ("白色警告页", _load_real_frame_bgr("vision/2026.11.07-02.10.18.652_HandleLoadingScreen_400000031.jpg"), False, "mean 251.5/std 22.1 有文字≠纯白"),
+            ("白色公告页", _load_real_frame_bgr("vision/2026.11.07-02.10.17.163_HandleLoadingScreen_400000025.jpg"), False, "mean 246.9/std 32.0 有文字≠纯白"),
+            ("亮标题帧(按钮可见)", _load_real_frame_bgr("vision/2026.11.07-02.11.05.315_HandleLoadingScreen_400000124.jpg"), False, "mean 239.7/std 23.1 ★旧规则会误判加载★"),
+            ("干净标题帧", _load_real_frame_bgr("screencap/2026.11.07-02.11.27.757_InGameSuccess.png"), False, "mean≈135/std≈73"),
+            ("合成纯白", np.full((720, 1280, 3), 250, np.uint8), True, "250/0"),
+            ("合成纯黑", np.full((720, 1280, 3), 5, np.uint8), True, "5/0"),
+            ("合成纯灰", np.full((720, 1280, 3), 128, np.uint8), True, "128/0"),
+        ]
+        for name, frame, expect, stat in cases:
+            got = is_loading_frame(frame, b, w, s, ws)
+            assert got == expect, f"{name} is_loading 期望 {expect} 得到 {got} ({stat})"
+            print(f"      {name:18s} is_loading={got!s:5s} (期望 {expect!s:5s}) {stat} "
+                  f"[实测 mean={frame.mean():.0f}/std={frame.std():.0f}]")
+        print(f"[17] 三态加载阈值真实帧验证 OK：黑屏/纯白(低方差)/纯色命中；"
+              f"亮标题帧(mean 239.7/std 23.1)、白色警告页/公告页(有文字)不误判 —— "
+              f"white_std_max={ws} 修掉了『亮场永不点按钮』的 P0")
+    except Exception as exc:
+        failures.append(f"三态阈值真实帧验证失败: {exc}")
+
+    # 18) P1-8 受控点击：源码级确认 run() 有 click_count/max_clicks 与达上限禁用点击
+    try:
+        src = (BASE_DIR / "main.py").read_text(encoding="utf-8")
+        run_src = src[: src.index("def static_self_check")]  # 只看 run()/辅助函数区，避免自证
+        assert "click_count = 0" in run_src and "max_clicks = int(flow.get(\"max_clicks\", 2))" in run_src, \
+            "run() 缺少受控点击计数（click_count / max_clicks）"
+        assert '"action": "DoNothing"' in run_src and "P1-8" in run_src, "重跑时未禁用点击动作(P1-8)"
+        assert int(cfg["flow"]["max_clicks"]) <= 2, "受控点击总次数上限必须 ≤2"
+        print(f"[18] P1-8 受控点击 OK：run() 维护 click_count，上限 max_clicks="
+              f"{cfg['flow']['max_clicks']}（≤2），达上限/几何未收敛时把 "
+              f"TitleScreenDetectedClick.action 覆盖为 DoNothing，不无限点击")
+    except Exception as exc:
+        failures.append(f"P1-8 检查失败: {exc}")
+
+    # 19) ★#14★ 连接前窗口预调整：compute_prealign_rect 纯函数单测（不启动游戏、不碰真实窗口）
+    try:
+        cases = [
+            # (mon_work(l,t,r,b), cur_rect(x,y,w,h), desired_size, expect)
+            ((0, 0, 2560, 1560), (-130, -102, 2268, 1328), None, (0, 0, 2268, 1328)),   # 基线越界→移入,尺寸不变
+            ((0, 0, 2560, 1560), (0, 0, 2589, 1585), None, (0, 0, 2560, 1560)),          # 超大→cap 到工作区
+            ((0, 0, 2560, 1560), (200, 100, 1600, 900), None, (200, 100, 1600, 900)),    # 已合法→不动
+            ((0, 0, 2560, 1560), (-2000, -2000, 1000, 800), None, (0, 0, 1000, 800)),    # 远负→移入
+            ((0, 0, 2560, 1560), (3000, 0, 800, 600), None, (1760, 0, 800, 600)),        # 远右→右对齐
+            ((-823, -216, -103, 864), (-900, -300, 720, 1080), None, (-823, -216, 720, 1080)),  # 副屏负坐标
+            ((0, 0, 2560, 1560), (0, 0, 1600, 900), [2268, 1328], (0, 0, 2268, 1328)),   # desired 覆盖
+        ]
+        for mon, cur, desired, expect in cases:
+            got = compute_prealign_rect(mon, cur, desired)
+            assert got == expect, f"compute_prealign_rect({mon},{cur},{desired}) 期望 {expect} 得到 {got}"
+        # 关键不变式：基线窗口经预调整后尺寸与原始一致（仅移动、不放大），且左上角落到非负
+        base = compute_prealign_rect((0, 0, 2560, 1560), (-130, -102, 2268, 1328), None)
+        assert (base[2], base[3]) == (2268, 1328), "基线窗口预调整后尺寸必须保持不变（不放大）"
+        assert base[0] >= 0 and base[1] >= 0, "预调整后左上角必须落在工作区内"
+        # 源码接线守护：prealign_window 存在且确实在 build_session 里、创建 controller 之前被调用
+        src = (BASE_DIR / "main.py").read_text(encoding="utf-8")
+        assert "def prealign_window(" in src, "缺少 prealign_window"
+        assert "def compute_prealign_rect(" in src, "缺少 compute_prealign_rect"
+        assert "prealign_window(win.hwnd, cfg)" in src, "build_session 未调用 prealign_window"
+        assert src.index("prealign_window(win.hwnd, cfg)") < src.index("Win32Controller(win.hwnd"), \
+            "prealign_window 必须在创建 Win32Controller 之前调用"
+        assert "def init_dpi_awareness(" in src, "缺少 init_dpi_awareness"
+        print(f"[19] ★#14 窗口预调整纯函数单测 OK（{len(cases)} 例 + 基线尺寸不变式 + build_session 接线）: "
+              f"基线越界仅移动不动尺寸、超大 cap、合法不动、负坐标/副屏 clamp、desired 覆盖")
+    except Exception as exc:
+        failures.append(f"窗口预调整纯函数单测失败: {exc}")
+
+    # 20) ★#18★ 三处根因的守护：置前接线 / 判定不得裸 inverse / 点击点落框内 + 模板几何一致
+    try:
+        src = (BASE_DIR / "main.py").read_text(encoding="utf-8")
+        run_src = src[: src.index("def static_self_check")]
+        run_body = src[src.index("def run(cfg: dict"): src.index("def static_self_check")]
+
+        # (a) ★#21 更新★ 判定必须走 post_click_verify 三态；裸 inverse 与旧稳定复检都不得回来
+        assert "post_click_verify(" in run_body, "run() 必须用 post_click_verify 做点击后三态判定"
+        assert "verdict == \"MARKER\"" in run_body and "OK_DEGRADED_UNVERIFIED" in run_body, \
+            "run() 必须按 MARKER / OK_DEGRADED_UNVERIFIED 分支返回"
+        assert "FAIL_NOT_CONFIRMED" in run_body, "未确认时必须有明确失败码 NOT_CONFIRMED"
+        assert "confirm_in_game_stable(" not in run_body, \
+            "run() 不得再调用 confirm_in_game_stable（其成功条件就是『按钮不可见』= 裸 inverse）"
+        assert "confirm_not_loading_stable(" not in run_body, \
+            "旧 confirm_not_loading_stable 已被 post_click_verify 取代（避免两套判定并存）"
+        assert 'if name == "HandleLoadingScreen" and self.clicked' in src, \
+            "loading_seen_after_click 必须限定『点击之后』才置位"
+
+        # (b) 置前接线：build_session 连接前 + run() 每轮 pipeline 前
+        bs = src[src.index("def build_session"): src.index("def make_button_visible_fn")]
+        assert "force_foreground(win.hwnd)" in bs, "build_session 未调用 force_foreground"
+        assert bs.index("force_foreground(win.hwnd)") < bs.index("Win32Controller(win.hwnd"), \
+            "force_foreground 必须在创建 Win32Controller 之前调用"
+        assert "AttachThreadInput" in src and "GetForegroundWindow" in src, \
+            "force_foreground 必须用 AttachThreadInput 绕过前台锁并校验 GetForegroundWindow"
+        assert "force_foreground(hwnd)" in run_body, "run() 每轮 pipeline 前未调用 force_foreground"
+
+        # (c) 点击点落在识别框内（真实调用 ClickCenterAction，用假 controller 收集坐标）
+        class _Job:
+            succeeded = True
+
+            def wait(self):
+                return self
+
+        class _Ctrl:
+            def __init__(self):
+                self.clicks = []
+
+            def post_click(self, x, y):
+                self.clicks.append((int(x), int(y)))
+                return _Job()
+
+        fake = _Ctrl()
+        ctx = type("Ctx", (), {"tasker": type("T", (), {"controller": fake})()})()
+        x0, y0, x1, y1 = cfg["recognition"]["template"]["crop"]
+        box = type("Box", (), {"x": x0, "y": y0, "w": x1 - x0, "h": y1 - y0})()
+        arv = type("Arg", (), {"box": box})()
+        clicked = ClickCenterAction().run(ctx, arv)
+        assert clicked and len(fake.clicks) == 1, "ClickCenterAction 未发出点击"
+        cx, cy = fake.clicks[0]
+        assert x0 <= cx <= x1 and y0 <= cy <= y1, f"点击点 ({cx},{cy}) 未落在识别框 {cfg['recognition']['template']['crop']} 内"
+        assert abs(cx - (x0 + x1) // 2) <= 1 and abs(cy - (y0 + y1) // 2) <= 1, \
+            f"点击点 ({cx},{cy}) 不是框中心"
+
+        # (d) 模板几何/阈值与实测一致
+        cal = cfg["recognition"]["calibration"]
+        thr = float(cfg["recognition"]["template"]["threshold"])
+        assert float(cal["negative_ncc_max"]) < thr < float(cal["visible_ncc_min"]), \
+            f"阈值 {thr} 未落在 (负样本最高 {cal['negative_ncc_max']}, 正样本最低 {cal['visible_ncc_min']}) 之间"
+        assert int(cfg["controller"]["screenshot_target_long_side"]) == 1280, "截图目标长边须为 1280（模板校准几何）"
+        assert int(cfg["controller"]["geometry_expect_height"]) == 720, "期望帧高须为 720"
+        print(f"[20] ★#18 三根因守护 OK★")
+        print(f"    (a) 判定: 走 post_click_verify 三态（MARKER / OK_DEGRADED_UNVERIFIED / NOT_CONFIRMED）；"
+              f"裸 inverse 与旧稳定复检均已移除")
+        print(f"    (b) 置前: build_session 连接前 + 每轮 pipeline 前均 force_foreground("
+              f"AttachThreadInput+SetForegroundWindow，校验 GetForegroundWindow)")
+        print(f"    (c) 点击: ClickCenter 实测点击 ({cx},{cy})，落在框 {cfg['recognition']['template']['crop']} 内且为框中心")
+        print(f"    (d) 几何/阈值: 长边={cfg['controller']['screenshot_target_long_side']}×高"
+              f"{cfg['controller']['geometry_expect_height']}；threshold={thr} ∈ "
+              f"({cal['negative_ncc_max']}, {cal['visible_ncc_min']})")
+    except Exception as exc:
+        failures.append(f"#18 三根因守护检查失败: {exc}")
+
+    # 21) ★#21★ post_click_verify 三态判定单测（虚拟时钟 + 合成帧序列，不启动游戏）
+    try:
+        import numpy as np
+        rng = np.random.default_rng(7)
+        game = rng.integers(0, 256, (720, 1280, 3), dtype=np.uint8)  # 有纹理、非加载
+        white = np.full((720, 1280, 3), 250, np.uint8)               # 纯白（加载态）
+        nop = lambda *a, **k: None
+        flow = cfg["flow"]
+        absent_need = float(flow["in_game_absent_sec"])
+        window = float(flow["in_game_verify_sec"])
+
+        def run_verify(clock, *, frames, vis_fn, alive=True, marker=None):
+            idx = {"i": 0}
+
+            def cap():
+                f = frames[min(idx["i"], len(frames) - 1)]
+                idx["i"] += 1
+                return f
+
+            return post_click_verify(
+                cfg, screencap_fn=cap, is_alive_fn=(lambda: alive) if callable(alive) else (lambda: alive),
+                button_visible_fn=vis_fn, marker_hit_fn=marker, log_fn=nop,
+                now_fn=lambda: clock["t"], sleep_fn=lambda s: clock.__setitem__("t", clock["t"] + s))
+
+        # 21a 仍在标题（按钮反复可见）→ STILL_TITLE，绝不判成功
+        c1 = {"t": 0.0}
+        v1, w1 = run_verify(c1, frames=[game] * 80, vis_fn=lambda f: True)
+        assert v1 == "STILL_TITLE", f"按钮一直可见应为 STILL_TITLE，实际 {v1} {w1}"
+        print(f"      [21a] 按钮反复可见: {v1}（{w1}）")
+
+        # 21b 按钮一直不见 + 非加载 → LEFT_TITLE，且必须等满 absent_sec 才下结论
+        c2 = {"t": 0.0}
+        v2, w2 = run_verify(c2, frames=[game] * 80, vis_fn=lambda f: False)
+        assert v2 == "LEFT_TITLE", f"连续不见应为 LEFT_TITLE，实际 {v2} {w2}"
+        assert c2["t"] >= absent_need, f"疑似结论必须等满 {absent_need}s，实际 {c2['t']:.1f}s"
+        print(f"      [21b] 连续 {absent_need:.0f}s 不见: {v2}（用时 {c2['t']:.1f}s）")
+
+        # 21c 正向模板命中 → MARKER（立即，不等窗口）
+        c3 = {"t": 0.0}
+        v3, w3 = run_verify(c3, frames=[game] * 80, vis_fn=lambda f: False, marker=lambda f: True)
+        assert v3 == "MARKER", f"marker 命中应为 MARKER，实际 {v3} {w3}"
+        assert c3["t"] <= 2.0, "marker 命中应立即返回，不应等窗口结束"
+        print(f"      [21c] 主界面模板命中: {v3}（{w3}）")
+
+        # 21d 点击后进程/窗口消失（实测客户端会重启）→ SESSION_LOST
+        c4 = {"t": 0.0}
+        v4, w4 = run_verify(c4, frames=[game], vis_fn=lambda f: False, alive=False)
+        assert v4 == "SESSION_LOST", f"进程消失应为 SESSION_LOST，实际 {v4} {w4}"
+        print(f"      [21d] 点击后进程消失: {v4}（{w4}）")
+
+        # 21e 一直加载（按钮不见但画面是纯白）→ 不得给疑似成功
+        c5 = {"t": 0.0}
+        v5, w5 = run_verify(c5, frames=[white] * 80, vis_fn=lambda f: False)
+        assert v5 == "TIMEOUT", f"持续加载应为 TIMEOUT，实际 {v5} {w5}"
+        assert c5["t"] >= window, "应等满整个判定窗口"
+        print(f"      [21e] 全程加载态: {v5}（{w5}）")
+
+        print("[21] ★#21 post_click_verify 三态单测 OK★（仍标题/连续不见/模板命中/会话丢失/全程加载 五例，"
+              "任何单帧「按钮消失」都不产生成功结论）")
+    except Exception as exc:
+        failures.append(f"#21 三态判定单测失败: {exc}")
+
+    # 22) ★#21★ 三态互斥语义 + 取证留图 + marker 为空不得判 OK_MARKER
+    try:
+        import tempfile
+        import numpy as np
+        src = (BASE_DIR / "main.py").read_text(encoding="utf-8")
+        run_body = src[src.index("def run(cfg: dict"): src.index("def static_self_check")]
+
+        # (a) 三态互斥且语义正确：UNVERIFIED 绝不 ok=True；NOT_CONFIRMED 与 OK_MARKER 互斥
+        codes = {OK_MARKER, OK_DEGRADED_UNVERIFIED, FAIL_NOT_CONFIRMED}
+        assert len(codes) == 3, "三种结果码必须互不相同"
+        assert "return False, OK_DEGRADED_UNVERIFIED" in run_body, \
+            "疑似成功必须 return False（不得当成功返回）"
+        assert "return True, OK_MARKER" in run_body, "只有正向模板命中才 return True"
+        assert "UNVERIFIED" in OK_DEGRADED_UNVERIFIED and "OK_" not in FAIL_NOT_CONFIRMED
+
+        # (b) 失败路径也留图：pipeline 未达标志 + 判定结论两个路径都要存
+        assert 'save_probe_frame(ctrl.post_screencap().wait().get(), "fail_no_flag"' in run_body, \
+            "失败路径（未达成功标志）未留图"
+        assert 'save_probe_frame(ctrl.post_screencap().wait().get(), "verdict"' in run_body, \
+            "判定时刻未留图"
+        assert "probe_fn=lambda f, tag: save_probe_frame(f, tag" in run_body, \
+            "三态判定各结论（marker/疑似/仍标题/超时）未接取证留图"
+
+        # (c) ★#22/#23★ marker 为 null / 空数组 / 文件缺失时绝不判 OK_MARKER
+        #     默认配置现已是 3 模板数组，故用「显式置空副本」验证降级守护。
+        #     ★#23★ 新增「直判」路径同样纳入守护：它绕开 sink.is_success 门槛，必须与
+        #     post_click_verify 一样在 marker 失效时禁用，绝不回退裸 inverse。
+        assert "marker_hit_fn = make_marker_hit_fn(tasker, cfg)" in run_body, \
+            "run() 必须用 make_marker_hit_fn（其内部做硬守护）"
+        assert "direct_marker_confirm(" in run_body, \
+            "run() 必须调用直判函数绕开 sink.is_success 门槛（#23 P1-2）"
+        assert 'if _direct_confirm("pipeline 前")' in run_body and \
+               'if _direct_confirm("门控前")' in run_body, \
+            "直判须在每轮 pipeline 前与门控前各一次（覆盖 SESSION_LOST 重连后的新会话）"
+        # ★#25★ 点击前守护已删除：(0,0) 场景（二次运行/--skip-launch/残留窗口已在主界面）
+        # 不得再被挡住，否则主界面无按钮可点会空转到 FAIL_MAX_RESTARTS。
+        assert "if click_count < 1 and restarts < 1:" not in run_body, \
+            "#25 已删除『点击前不直判』守护，直判须每轮都执行"
+        for bad, desc in [(None, "null"), ([], "空数组"), (["__missing__.png"], "文件缺失")]:
+            c = json.loads(json.dumps(cfg))
+            c["recognition"]["in_game_marker_template"] = bad
+            assert build_marker_params(c) is None, f"marker={desc} 时 build_marker_params 必须返回 None"
+            assert make_marker_hit_fn(None, c) is None, f"marker={desc} 时不得返回命中函数"
+            assert direct_marker_confirm(None, c, make_marker_hit_fn(None, c)) is False, \
+                f"marker={desc} 时直判路径也必须禁用（绝不判 OK_MARKER）"
+            ov_empty = build_pipeline_override(c)
+            assert ov_empty["InGameSuccess"]["inverse"] is True and \
+                   not any(k.startswith("InGameMarker_") for k in ov_empty), \
+                   f"marker={desc} 时不得生成正向节点且 InGameSuccess 维持 inverse"
+            assert ov_empty["InGameSuccess"]["template"] == build_detection_params(c)["template"], \
+                f"marker={desc} 时 InGameSuccess 的 template 仍是按钮模板，不得变成主界面模板"
+        # ★#23 P1-1★ marker 有效时 override 同样不得含死节点（不只是空配置）
+        assert not any(k.startswith("InGameMarker_") for k in build_pipeline_override(cfg)), \
+            "marker 有效时 build_pipeline_override 同样不得生成 InGameMarker_* 死节点"
+        print("    marker 守护: null/空数组/文件缺失 → build_marker_params=None、"
+              "make_marker_hit_fn=None、直判禁用、无正向节点、InGameSuccess 维持 inverse；"
+              "直判在 pipeline 前+门控前各一次（绝不判 OK_MARKER）；"
+              "#25 已删除『点击前不直判』守护（(0,0) 场景不再被挡）")
+
+        # (d) 取证留图函数本身可用：1280×720 原图落盘、命名含 in_game_probe_、不覆盖已有文件
+        tmpd = Path(tempfile.mkdtemp(prefix="probe_test_"))
+        frame = np.zeros((720, 1280, 3), np.uint8)
+        frame[:, :, 2] = 200  # BGR 蓝
+        p1 = save_probe_frame(frame, "selftest", log_fn=lambda *a, **k: None, out_dir=tmpd)
+        assert p1 and Path(p1).is_file(), "取证留图未生成文件"
+        assert "in_game_probe_" in Path(p1).name and "_selftest.png" in Path(p1).name
+        with open(p1, "rb") as f:
+            head = f.read(33)
+        assert head[:8] == b"\x89PNG\r\n\x1a\n", "留图不是 PNG"
+        assert struct.unpack(">II", head[16:24]) == (1280, 720), "留图必须是原始 1280×720"
+        # (e) ★#21★ 最终文案与退出码必须三态分明（用户不能把 exit 3 看成失败）——实测调用
+        main_body = src[src.index("def main(argv=None)"):]
+        assert "report_result(reason)" in main_body, "main() 必须走 report_result 统一三态输出"
+
+        l1: list[str] = []
+        assert report_result(OK_MARKER, log_fn=l1.append) == 0, "OK_MARKER 退出码必须为 0"
+        assert any("结果: 成功（已确认进入主界面）" in x for x in l1), f"OK_MARKER 文案不对: {l1}"
+
+        l2: list[str] = []
+        assert report_result(FAIL_NOT_CONFIRMED, log_fn=l2.append) == 2, "NOT_CONFIRMED 退出码必须为 2"
+        assert any("结果: 失败（未离开标题画面）" in x for x in l2), f"NOT_CONFIRMED 文案不对: {l2}"
+
+        l3: list[str] = []
+        assert report_result(OK_DEGRADED_UNVERIFIED, log_fn=l3.append) == 3, "UNVERIFIED 退出码必须为 3"
+        assert any("结果: 疑似成功（已离开标题并进入加载/游戏，但未确认主界面）" in x for x in l3), \
+            f"UNVERIFIED 文案不对: {l3}"
+        assert any("这不是失败，是待确认" in x for x in l3), "exit 3 必须显式声明『不是失败，是待确认』"
+        assert any("in_game_probe_" in x or "判定留图" in x for x in l3), "exit 3 必须打印 probe 留图路径/提示"
+        assert not any("失败（" in x and "疑似" not in x for x in l3), "exit 3 的输出不得出现『失败（』字样"
+
+        print(f"[22] ★#21 三态/留图/marker 守护 OK★: 三态互斥且 UNVERIFIED 不返回成功；"
+              f"失败路径与判定结论均留图；marker 为空时不会判 OK_MARKER；"
+              f"留图实测 {Path(p1).name}（1280×720 PNG，只新增不覆盖）；"
+              f"实测 report_result → 0/2/3 且 exit 3 文案含『疑似成功/待确认』不含『失败（』")
+    except Exception as exc:
+        failures.append(f"#21 三态/留图检查失败: {exc}")
+
+    # 23) ★#21★ 真实加载页（用户素材）复合判据 + 回归（模板命中不得把标题帧误判成加载）
+    try:
+        import numpy as np
+        lt = cfg["recognition"]["loading_template"]
+        lf = cfg["recognition"]["loading_frame"]
+        tpl_path = IMAGE_DIR / lt["file"]
+        assert tpl_path.is_file(), f"缺少加载页模板 {tpl_path}"
+        with tpl_path.open("rb") as f:
+            head = f.read(33)
+        tw, th = struct.unpack(">II", head[16:24])
+        assert (tw, th) == (255, 39), f"加载页模板尺寸应为 255x39，实际 {tw}x{th}"
+
+        kw = dict(black_mean_max=lf["black_mean_max"], white_mean_min=lf["white_mean_min"],
+                  std_min=lf["std_min"], white_std_max=lf["white_std_max"],
+                  template=lt["file"], template_threshold=float(lt["threshold"]),
+                  template_roi=tuple(lt["roi"]))
+
+        loading_page = _load_real_frame_bgr("20-loading-1280.png")   # 用户素材归一化到 1280×720
+        hit, info = detect_loading_frame(loading_page, **kw)
+        score = match_loading_template(loading_page, lt["file"], tuple(lt["roi"]))
+        assert hit and info.get("reason") == "loading-template", \
+            f"真实加载页必须判加载态且走模板判据，实际 hit={hit} info={info}"
+        assert score >= float(lt["threshold"]), f"加载页模板得分 {score:.3f} 低于阈值 {lt['threshold']}"
+        print(f"      真实加载页 artifacts/20-loading-1280.png（用户素材归一化）: is_loading={hit} "
+              f"reason={info['reason']} tpl_score={score:.3f} mean={info.get('mean')} std={info.get('std')}")
+
+        # 回归：亮标题帧 / 干净标题帧 不得因模板被误判成加载（全部为真实帧文件）
+        for name, stat in [("vision/2026.11.07-02.11.05.315_HandleLoadingScreen_400000124.jpg", "亮标题 mean 239.7/std 23.1"),
+                           ("vision/2026.11.07-02.10.22.145_HandleLoadingScreen_400000041.jpg", "干净标题"),
+                           ("screencap/2026.11.07-02.11.27.757_InGameSuccess.png", "判定帧")]:
+            fr = _load_real_frame_bgr(name)
+            hit, info = detect_loading_frame(fr, **kw)
+            assert not hit, f"{name} 不应判加载态（{stat}），实际 info={info}"
+            print(f"      {name:64s} is_loading=False tpl_score={info.get('tpl_score')} ({stat})")
+
+        # 回归：真黑屏仍必须命中（统计判据），纯白/纯灰同理
+        for name, expect in [("vision/2026.11.07-02.10.16.166_HandleLoadingScreen_400000021.jpg", True)]:
+            fr = _load_real_frame_bgr(name)
+            hit, info = detect_loading_frame(fr, **kw)
+            assert hit, f"{name} 应判加载态（真黑屏过渡），实际 info={info}"
+            print(f"      {name:64s} is_loading=True reason={info['reason']}")
+        for label, val in [("合成纯白", 250), ("合成纯黑", 5), ("合成纯灰", 128)]:
+            fr = np.full((720, 1280, 3), val, np.uint8)
+            hit, info = detect_loading_frame(fr, **kw)
+            assert hit and info["reason"].startswith("stats"), f"{label} 应由统计判据命中，实际 {info}"
+            print(f"      {label:18s} is_loading=True reason={info['reason']} tpl_score={info.get('tpl_score')}")
+
+        print(f"[23] ★#21 真实加载页判据 OK★：Now Loading 模板 {tw}x{th}，真实加载页 tpl={score:.3f} ≥ {lt['threshold']}；"
+              f"标题帧/判定帧全部 False（模板未误伤），真黑屏与纯色仍由统计判据命中")
+    except Exception as exc:
+        failures.append(f"#21 加载页判据检查失败: {exc}")
+
+    # 24) ★#22★ 主界面模板端到端（真实 MaaFW bundle）+ 加载态不误判 + 空/缺文件守护
+    try:
+        spec = build_marker_params(cfg)
+        assert spec is not None and len(spec["template"]) == 3
+        for f in spec["template"]:
+            assert (IMAGE_DIR / f).is_file(), f"缺少主界面模板 {f}"
+
+        home = _load_real_frame_bgr("screencap/in_game_probe_2026.11.07-10.50.00.294_unverified.png")
+        title = _load_real_frame_bgr("screencap/in_game_probe_2026.11.07-10.48.45.318_verdict.png")
+        loading_page = _load_real_frame_bgr("20-loading-1280.png")
+        tasker, ctrl, cleanup = _make_static_tasker(home, cfg)
+        try:
+            hitfn = make_marker_hit_fn(tasker, cfg)
+            assert hitfn is not None, "已配置 3 模板时 make_marker_hit_fn 必须可用"
+            assert hitfn(home) is True, "真实主界面帧必须命中正向主界面模板（→ OK_MARKER）"
+            assert hitfn(title) is False, "标题帧绝不可命中主界面模板"
+            assert hitfn(loading_page) is False, "加载页帧绝不可命中主界面模板"
+            # ★#23★ 直判路径（绕开 sink.is_success 门槛）同样不得误报：
+            # 主界面命中，标题帧/加载页帧/marker 失效一律不命中
+            assert direct_marker_confirm(home, cfg, hitfn) is True, "主界面帧直判须命中"
+            assert direct_marker_confirm(title, cfg, hitfn) is False, "标题帧直判不得命中"
+            assert direct_marker_confirm(loading_page, cfg, hitfn) is False, "加载页帧直判不得命中"
+            assert direct_marker_confirm(home, cfg, None) is False, "marker 失效时直判须禁用"
+        finally:
+            cleanup()
+
+        src = (BASE_DIR / "main.py").read_text(encoding="utf-8")
+        assert "if not loading and marker_hit_fn is not None" in src, \
+            "post_click_verify 必须先排除加载态再做正向判定"
+
+        # 单字符串（可插拔）仍兼容
+        c_one = json.loads(json.dumps(cfg))
+        c_one["recognition"]["in_game_marker_template"] = spec["template"][0]
+        assert build_marker_params(c_one)["template"] == [spec["template"][0]], \
+            "in_game_marker_template 仍须兼容单字符串"
+
+        # ★#23 P2-1★ 空阈值数组不得触发 thrs[-1] IndexError（回退默认 0.7 广播）
+        c_empty_thr = json.loads(json.dumps(cfg))
+        c_empty_thr["recognition"]["in_game_marker_threshold"] = []
+        spec_empty = build_marker_params(c_empty_thr)
+        assert spec_empty is not None and spec_empty["threshold"] == [0.7, 0.7, 0.7] and \
+               spec_empty["template"] == spec["template"], \
+            "空阈值数组须回退默认 0.7 并广播到 3 模板，不得崩溃/不返回 None"
+
+        # ★#25 P1-1★ 低阈值 / 长度不一致配置一律禁用正向判定（防标题帧假成功）。
+        # 复核用真实 MaaFW 判定器实测：标题帧 home_lb_diamond score=0.507051，阈值 ≤0.507 即误命中。
+        for bad_thr, desc in [([0.1] * 3, "[0.1]*3"),
+                              ([0.5] * 3, "[0.5]*3"),
+                              ([0.1, 0.2], "[0.1,0.2] 长度不足"),
+                              ([0.1, 0.2, 0.3, 0.4, 0.5], "[0.1..0.5] 长度超出")]:
+            c_bad = json.loads(json.dumps(cfg))
+            c_bad["recognition"]["in_game_marker_threshold"] = bad_thr
+            assert build_marker_params(c_bad) is None, \
+                f"阈值 {desc} 必须被拒绝（下限 0.55 / 长度须与模板等长）"
+            bad_hitfn = make_marker_hit_fn(None, c_bad)
+            assert bad_hitfn is None, f"阈值 {desc} 时不得返回命中函数"
+            assert direct_marker_confirm(title, c_bad, bad_hitfn) is False, \
+                f"阈值 {desc} 时标题帧直判不得命中（绝不假成功）"
+        assert build_marker_params(cfg) is not None and \
+               len(build_marker_params(cfg)["template"]) == 3, \
+            "当前校准配置 [0.55,0.75,0.6] 必须仍返回 3 模板参数"
+
+        print(f"[24] ★#22/#23/#25 主界面模板端到端 OK★: 真实 MaaFW bundle 下 主界面帧命中 / "
+              f"标题帧与加载页帧均不命中；直判路径同款守护（标题/加载页/marker 失效不误报）；"
+              f"加载态不参与判定（源码守护）；3 模板各自 roi={spec['roi']} "
+              f"threshold={spec['threshold']}；单字符串兼容；空阈值数组回退 0.7 不崩溃；"
+              f"★#25 低阈值/长度不齐 4 组畸形配置一律禁用正向判定、标题帧直判 False★；"
+              f"marker=null/空数组/文件缺失 一律禁用正向判定（绝不判 OK_MARKER）")
+    except Exception as exc:
+        failures.append(f"#22/#23 主界面模板检查失败: {exc}")
+
+    # 25) ★#23 P1-1③★ 把**完整** build_pipeline_override（与 run() 同源）喂给真实 post_task。
+    #     历史盲区：[10] 用自定义最小 ov、[24] 用 post_recognition、[14] 用原始 login.json 的
+    #     post_bundle —— 「含 override 的完整节点图」从未被 post_task 真跑过一次。这里补上。
+    try:
+        home25 = _load_real_frame_bgr("screencap/in_game_probe_2026.11.07-10.50.00.294_unverified.png")
+        entry25, _, _ = select_task(cfg)
+        full_ov = build_pipeline_override(cfg)
+        assert full_ov["InGameSuccess"]["inverse"] is True, "完整 override 不得改变三态结构"
+        assert not any(k.startswith("InGameMarker_") for k in full_ov), \
+            "完整 override 不得含孤立死节点"
+        tasker, ctrl, cleanup = _make_static_tasker(home25, cfg)
+        try:
+            job = tasker.post_task(entry25, full_ov)   # 与 run() 同源的完整 override
+            assert job is not None, "post_task 未返回 job"
+            tasker.post_stop()   # 静态帧下 pipeline 会等超时节点，立即停止；只验证注入/节点图
+            job.wait()
+            assert tasker.inited, "注入完整 override 后 tasker 失效"
+        finally:
+            cleanup()
+        print(f"[25] ★#23 完整 override 注入 post_task 成功★: {len(full_ov)} 项覆盖、节点图合法、"
+              f"未抛异常；静态帧下立即 post_stop 不等待 pipeline 结果；"
+              f"InGameSuccess inverse=True 与三态不受影响；无 InGameMarker_* 死节点（P1-1 盲区已补）")
+    except Exception as exc:
+        failures.append(f"#23 完整 override 注入检查失败: {exc}")
+
+    print("-" * 70)
+    if failures:
+        for f in failures:
+            print(f"  [FAIL] {f}")
+        print(f"静态自测未通过：{len(failures)} 项")
+        return False
+    print("静态自测全部通过（未启动游戏、未点击真实窗口、未创建 Win32 控制器）。")
+    return True
+
+
+def report_result(reason: str, *, log_fn=None) -> int:
+    """★#21★ 三态最终输出：文案与退出码一一对应（team-lead 裁定：exit 3 不是失败，是待确认）。
+
+    0 = 成功（已确认进入主界面） / 3 = 疑似成功（未确认） / 2 = 失败（未离开标题）。
+    exit 3 时紧接着打印最新 probe 图路径，提示据此补主界面模板。
+    """
+    log_fn = log_fn or log
+    if reason == OK_MARKER:
+        log_fn(f"结果: 成功（已确认进入主界面） [{reason}] 退出码 0")
+        return 0
+    if reason == OK_DEGRADED_UNVERIFIED:
+        log_fn(f"结果: 疑似成功（已离开标题并进入加载/游戏，但未确认主界面） [{reason}] "
+               f"退出码 3 —— ★这不是失败，是待确认★")
+        probes = []
+        try:
+            probes = sorted((DEBUG_DIR / "screencap").glob("in_game_probe_*.png"),
+                            key=lambda p: p.stat().st_mtime, reverse=True)[:3]
+        except OSError:
+            pass
+        for p in probes:
+            log_fn(f"   判定留图: {p}")
+        log_fn("   提示：从上面的 in_game_probe_*.png 里挑一张确认为主界面的帧，裁模板填 "
+               "config.recognition.in_game_marker_template，即可把「疑似成功」升级为「成功（已确认）」")
+        return 3
+    if reason == FAIL_NOT_CONFIRMED:
+        log_fn(f"结果: 失败（未离开标题画面） [{reason}] 退出码 2")
+        return 2
+    log_fn(f"结果: 失败（{reason}） 退出码 2")
+    return 2
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description="SongForPrism 自动登录")
+    ap.add_argument("--check", action="store_true", help="静态自测后退出（不启动游戏）")
+    ap.add_argument("--skip-launch", action="store_true", help="跳过启动，仅附加到已存在窗口")
+    args = ap.parse_args(argv)
+
+    cfg = load_settings()
+    if args.check:
+        return 0 if static_self_check(cfg) else 1
+
+    _ok, reason = run(cfg, skip_launch=args.skip_launch)
+    return report_result(reason)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

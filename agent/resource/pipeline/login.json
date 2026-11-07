@@ -1,0 +1,151 @@
+{
+    "LoginAndStart": {
+        "recognition": "DirectHit",
+        "action": "DoNothing",
+        "next": [
+            "[JumpBack]HandleLoadingScreen",
+            "TitleScreenDetectedClick"
+        ],
+        "timeout": 30000,
+        "rate_limit": 1000,
+        "on_error": "HandleFailure"
+    },
+    "TitleScreenDetectedClick": {
+        "recognition": "TemplateMatch",
+        "template": [
+            "touch_to_start.png",
+            "touch_to_start_v2.png",
+            "touch_to_start_v3.png",
+            "touch_to_start_v4.png",
+            "touch_to_start_v5.png",
+            "touch_to_start_v6.png",
+            "touch_to_start_v7.png",
+            "touch_to_start_v8.png"
+        ],
+        "threshold": 0.5,
+        "method": 5,
+        "roi": [
+            380,
+            540,
+            520,
+            90
+        ],
+        "action": "Custom",
+        "custom_action": "ClickCenter",
+        "next": [
+            "WaitInGame"
+        ],
+        "post_delay": 1500
+    },
+    "WaitInGame": {
+        "recognition": "DirectHit",
+        "action": "DoNothing",
+        "next": [
+            "[JumpBack]HandleLoadingScreen",
+            "InGameSuccess"
+        ],
+        "timeout": 60000,
+        "rate_limit": 1000,
+        "on_error": "HandleFailure"
+    },
+    "InGameSuccess": {
+        "recognition": "TemplateMatch",
+        "template": [
+            "touch_to_start.png",
+            "touch_to_start_v2.png",
+            "touch_to_start_v3.png",
+            "touch_to_start_v4.png",
+            "touch_to_start_v5.png",
+            "touch_to_start_v6.png",
+            "touch_to_start_v7.png",
+            "touch_to_start_v8.png"
+        ],
+        "threshold": 0.5,
+        "method": 5,
+        "roi": [
+            380,
+            540,
+            520,
+            90
+        ],
+        "inverse": true,
+        "action": "Screencap",
+        "next": [
+            "LoginSuccess"
+        ],
+        "post_delay": 300
+    },
+    "LoginSuccess": {
+        "recognition": "DirectHit",
+        "action": "StopTask"
+    },
+    "LoginTitleOnly": {
+        "recognition": "DirectHit",
+        "action": "DoNothing",
+        "next": [
+            "[JumpBack]HandleLoadingScreen",
+            "TitleScreenDetected"
+        ],
+        "timeout": 30000,
+        "rate_limit": 1000,
+        "on_error": "HandleFailure"
+    },
+    "TitleScreenDetected": {
+        "recognition": "TemplateMatch",
+        "template": [
+            "touch_to_start.png",
+            "touch_to_start_v2.png",
+            "touch_to_start_v3.png",
+            "touch_to_start_v4.png",
+            "touch_to_start_v5.png",
+            "touch_to_start_v6.png",
+            "touch_to_start_v7.png",
+            "touch_to_start_v8.png"
+        ],
+        "threshold": 0.5,
+        "method": 5,
+        "roi": [
+            380,
+            540,
+            520,
+            90
+        ],
+        "action": "Screencap",
+        "next": [
+            "LoginSuccess"
+        ],
+        "post_delay": 300
+    },
+    "HandleLoadingScreen": {
+        "recognition": "Custom",
+        "custom_recognition": "LoadingScreenReco",
+        "custom_recognition_param": {
+            "black_mean_max": 45,
+            "white_mean_min": 220,
+            "white_std_max": 12,
+            "std_min": 8,
+            "loading_template": "loading_now.png",
+            "loading_template_threshold": 0.6,
+            "loading_template_roi": [
+                860,
+                630,
+                340,
+                90
+            ]
+        },
+        "action": "DoNothing",
+        "next": []
+    },
+    "HandleFailure": {
+        "recognition": "DirectHit",
+        "action": "Screencap",
+        "filename": "failure",
+        "next": [
+            "DoStop"
+        ]
+    },
+    "DoStop": {
+        "recognition": "DirectHit",
+        "action": "StopTask"
+    }
+}

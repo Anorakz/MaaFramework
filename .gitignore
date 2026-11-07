@@ -458,3 +458,12 @@ temp/*
 
 # BatchOcrRepro 用例的 OCR 模型，构建时从 TestingDataSet 子模块复制
 test/pipeline/resources/BatchOcrRepro/resource/model/
+
+# SongForPrism 自动登录 agent/ 可交付基线（#33）
+# 顶层运行时取证产物（agent/ 内同名目录由 agent/.gitignore 覆盖）
+on_error/
+# WorkBuddy 本机工作区数据：.git/info/exclude 已本地忽略，此处让规则对团队生效
+.workbuddy/
+# Python 运行期残留
+*.pyo
+.pytest_cache/

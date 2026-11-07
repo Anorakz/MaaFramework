@@ -1,0 +1,4 @@
+# 安装（必须显式带官方源；本机 pip 全局指向清华镜像，无 maafw）：
+#   python -m pip install -r requirements.txt -i https://pypi.org/simple
+# import 名为 maa，安装名为 maafw；wheel 自带预编译 DLL，零编译。
+maafw==5.15.0
