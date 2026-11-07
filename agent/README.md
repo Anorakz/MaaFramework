@@ -866,3 +866,58 @@ rand_point）→ 轮询正向确认（`step_timeout_sec=15`）→ 超时按 `ste
   时误为 False（登录 19:22:19 已 `OK_MARKER` 成功）。已修为
   `login_ok = ok or (reason == FAIL_MV_FLOW)` —— 登录事实不被 MV 附加流程结果覆盖；
   `--check [27](e)` 与 `36-verify.py` I 段断言守护。
+
+## 16. #54 自动打歌（跳过模式）流程（play_enabled，登录成功后自动跑，默认关闭）
+
+登录确认 `OK_MARKER` 后自动执行「打歌（跳过模式）」八步流程并回到主界面。
+**默认关闭**（`flow.play_enabled=false`）。实跑：`agent\run.bat --play-enabled`
+（仅内存覆盖不落盘）。★`--mv-enabled` 与 `--play-enabled` 互斥：同时开启时 **MV 优先**、
+打歌跳过并 WARN（写死于 `_finish_ok`）；与 `--mv-explore` 同开时采集优先、自动流程全跳过。
+
+### 16.1 八步语义（20.15~20.16 真实素材目视确认）
+
+| 步 | id | 动作 | 模板（roi / 阈值） | 确认 |
+| --- | --- | --- | --- | --- |
+| ① | `1_click_live` | 主界面点 Live | `home_nav_bottom_right.png`（[1040,570,240,150] / 0.55） | `play_decide_button` 出现 |
+| ② | `2_click_decide` | 乐曲选择页点「決定」 | `play_decide_button.png`（[1030,630,250,90] / 0.75） | `play_skip_button` 出现 |
+| ③ | `3_click_skip` | 队伍确认页点「跳过」 | `play_skip_button.png`（[1090,630,190,90] / **0.85**） | `play_dialog_title` 出现 |
+| ④ | `4_dialog_start` | 弹窗点「開 始」 | `play_start_button.png`（[620,630,260,90] / 0.75）+ **precheck** | `play_result_title` 出现 |
+| ⑤ | `5_click_ok` | 結果页点「OK」 | `play_ok_button.png`（[500,640,280,80] / 0.75） | `play_skip_button` 出现（回队伍确认页） |
+| ⑥ | `6_back_team` | 队伍确认页点 ◀ | `mv_back_button.png`（[0,630,110,90] / 0.75） | `play_decide_button` 出现 |
+| ⑦ | `7_back_song` | 乐曲选择页点 ◀ | `mv_back_button.png`（同上 / 0.75） | home（Loading→主界面） |
+| ⑧ | `8_confirm_home` | 纯确认（click=none） | — | home（幂等二次确认） |
+
+### 16.2 模板 NCC（`40-ncc.py` / `40-back-probe.log`）
+
+| 模板 | 正样本 min | 真负样本 max | 阈值 |
+| --- | --- | --- | --- |
+| `play_decide_button`（195×52） | 0.893 | 0.608 | 0.75 |
+| `play_skip_button`（115×30，只裁『跳过』避开数字） | 0.973（剩余 9/10/8 次三帧全过） | 0.714 | **0.85** |
+| `play_start_button`（205×52） | 1.000 | 0.443 | 0.75 |
+| `play_ok_button`（200×42） | 0.894 | 0.385 | 0.75 |
+| `play_dialog_title`（258×30） | 1.000 | 0.479 | 0.75 |
+| `play_result_title`（326×29） | 0.946 | 0.338 | 0.75 |
+| `play_max_checked`（60×33，勾选态） | 0.972 | 0.599 | 0.80 |
+| `mv_back_button` 复用（play 段阈值 **0.75**） | 打歌乐曲选择 0.994/0.997、队伍确认 0.786~0.838 | 打歌主界面 0.548 | mv 段维持 0.8 |
+
+### 16.3 条件分支与互斥（★新流程形态★）
+
+- **precheck 前置钩子**（配置驱动，通用机制在 `_run_flow_generic`）：第 ④ 步点「開 始」前先截帧
+  查 `play_max_checked`（常に最大已勾选态）：命中 → 直接点開始；未命中 → 几何守卫后按
+  `coord=[479,380]` 点勾选框一次 → 重新截帧验证 → 命中则点開始；**仍未命中 → WARN + 留图
+  `play_max_unchecked` → ★仍继续点開始★**（未勾选不危险，只是 LB 消耗非最大；如实记录降级）。
+  常に最大未勾选态零素材，此分支按上述降级设计。
+- **互斥**：`mv_enabled` 与 `play_enabled` 双开 → WARN + **MV 优先**（打歌跳过）；
+  结果文件 `flow` 字段亦按此优先级（schema v2）。
+- **结果文件 schema v2**：新增 `flow` 字段（`none`/`mv_explore`/`mv`/`play`）与
+  `config_snapshot.mv_enabled/play_enabled`；`mode` 保留旧语义向后兼容（v1 读取者不受影响）。
+- **通用执行器**：`run_mv_flow` / `run_play_flow` 共用 `_run_flow_generic`（弹窗钩子 / precheck /
+  `click=none` 纯确认步 / 重试 / 几何守卫全部配置驱动，无复制粘贴）。
+
+### 16.4 边界与未知项（按未知处理，绝不脑补）
+
+常に最大未勾选态零素材（precheck 降级设计）；跳过剩余 0 次时点跳过的行为未知（安全中止）；
+LB=0 时流程会在某步失败（安全中止，**LB 道具恢复明确不做**，0021~0022 素材不作实现依据）；
+結果页 SS 评级/偶像数值为动态内容严禁裁模板；弹窗「取消」、队伍确认页「自動 剩余20次」粉钮
+一律不点；跨会话/曲目/难度泛化未验证。验收：`--check [29]` + `40-verify.py`（17 项断言）；
+详见 `.workbuddy/artifacts/40-play-flow.md`。

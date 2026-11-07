@@ -103,6 +103,7 @@ FAIL_MAX_RESTARTS = "MAX_RESTARTS_EXCEEDED"
 FAIL_DETERMINISTIC = "DETERMINISTIC_FAILURE"  # 第3次同窗退出，停止重试并上报
 FAIL_STABLE_TIMEOUT = "STABLE_CONFIRM_TIMEOUT"  # 点击后加载态迟迟不结束，稳定复检超时
 FAIL_MV_FLOW = "MV_FLOW_FAILED"  # ★#49★ 登录已成功但 MV 自动观看流程失败（选项 B → exit 2）
+FAIL_PLAY_FLOW = "PLAY_FLOW_FAILED"  # ★#54★ 登录已成功但自动打歌流程失败（选项 B → exit 2）
 FAIL_NOT_CONFIRMED = "NOT_CONFIRMED"  # ★#18★ 未观察到加载态、也无正向主界面标志 → 不得判成功
 
 ELEVATION_HINT = (
@@ -1577,6 +1578,11 @@ def mv_flow_enabled(cfg: dict) -> bool:
     return bool(cfg.get("flow", {}).get("mv_enabled", False))
 
 
+def play_flow_enabled(cfg: dict) -> bool:
+    """★#54★ 自动打歌流程总开关：flow.play_enabled 默认 false（缺 key 兼容旧配置）。"""
+    return bool(cfg.get("flow", {}).get("play_enabled", False))
+
+
 def _mv_match(tasker, frame, tpl: str, threshold: float, roi):
     """★#49★ MV 单模板判定（同 make_marker_hit_fn 的 post_recognition 机制）。
 
@@ -1619,21 +1625,58 @@ def run_mv_flow(cfg: dict, *, ctrl, tasker, hwnd, marker_hit_fn, monitor,
       → ④MV 载入播放，点屏幕唤起控制条 → ⑤点顶部最右 ⏭ 退出 → Loading
       → ⑥落回乐曲选择页，点左下 ◀ → ⑦主界面（marker 三模板正向确认）。
 
-    每步：force_foreground → 截帧 → 模板判定 → box_center 点击（coord 步先做
-    1280×720±4 几何守卫，绝不按错误坐标乱点）→ 轮询正向确认（step_timeout_sec）
-    → 超时按 step_retry 重试 → 失败留图 mv_fail_<step> 并 WARN。
-    「乐曲选择 → 主界面」最后一段零素材、是否有确认弹窗【未知】：确认超时/意外
-    弹窗一律 WARN+留图，绝不脑补点击。
     业务失败（步骤重试耗尽 / 整体超时 / 进程退出）返回 (False, why) → FAIL_MV_FLOW；
     不重启游戏、不改阈值、不进登录兜底。
-    sleep_fn / now_fn / save_fn / log_fn 可注入（离线单测用 fake clock 与 mock 控制器）。
+    ★#54★ 通用机制抽入 _run_flow_generic（与 run_play_flow 共用），本壳只读 flow.mv 配置。
+    """
+    return _run_flow_generic(
+        cfg, ctrl=ctrl, tasker=tasker, hwnd=hwnd, marker_hit_fn=marker_hit_fn,
+        monitor=monitor, flowcfg=cfg.get("flow", {}).get("mv") or {},
+        label="MV 自动观看流程", short="MV", tag_prefix="mv",
+        log_fn=log_fn, sleep_fn=sleep_fn, now_fn=now_fn, save_fn=save_fn)
+
+
+def run_play_flow(cfg: dict, *, ctrl, tasker, hwnd, marker_hit_fn, monitor,
+                  log_fn=log, sleep_fn=time.sleep, now_fn=time.monotonic,
+                  save_fn=None) -> tuple[bool, str]:
+    """★#54★ 自动打歌（跳过模式）流程（flow.play_enabled=true 时由 _finish_ok 调用）。
+
+    八步语义（按 20.15~20.16 真实采集素材目视确认）：
+      ①主界面点 Live → ②乐曲选择页点「決定」 → ③队伍确认页点「跳过」（避开剩余次数数字）
+      → ④スキップライブ確認弹窗：precheck「常に最大已勾选」（未命中点勾选框一次后重验，
+        仍未命中 WARN+留图并★降级继续★）→ 点「開 始」 → ⑤結果页点「OK」
+      → ⑥队伍确认页点 ◀ → ⑦乐曲选择页点 ◀ → ⑧主界面确认（marker 三模板，留图
+        play_return_home）。
+
+    业务失败返回 (False, why) → FAIL_PLAY_FLOW；与 run_mv_flow 共用 _run_flow_generic
+    通用机制（precheck/弹窗钩子/重试/几何守卫全部配置驱动）。
+    """
+    return _run_flow_generic(
+        cfg, ctrl=ctrl, tasker=tasker, hwnd=hwnd, marker_hit_fn=marker_hit_fn,
+        monitor=monitor, flowcfg=cfg.get("flow", {}).get("play") or {},
+        label="自動打歌（跳过模式）流程", short="打歌", tag_prefix="play",
+        log_fn=log_fn, sleep_fn=sleep_fn, now_fn=now_fn, save_fn=save_fn)
+
+
+def _run_flow_generic(cfg: dict, *, ctrl, tasker, hwnd, marker_hit_fn, monitor,
+                      flowcfg, label: str, short: str, tag_prefix: str,
+                      log_fn=log, sleep_fn=time.sleep, now_fn=time.monotonic,
+                      save_fn=None) -> tuple[bool, str]:
+    """★#49/#54★ 通用多步流程执行器（run_mv_flow / run_play_flow 共用）。
+
+    每步：force_foreground → 截帧 → precheck 前置钩子（可选，配置驱动）→ 模板判定 →
+    box_center 点击（coord 步先做 1280×720±4 几何守卫，click=none 为纯确认步）→
+    轮询正向确认（step_timeout_sec）→ 超时按 step_retry 重试 → 失败留图
+    {tag_prefix}fail_<step> 并 WARN。确认等待中每次采样先过 _check_dialog 弹窗钩子。
+    未知弹窗段一律 WARN+留图，绝不脑补点击。
+    业务失败（步骤重试耗尽 / 整体超时 / 进程退出）返回 (False, why)；不重启游戏、
+    不改阈值、不进登录兜底。sleep_fn/now_fn/save_fn/log_fn 可注入（离线单测）。
     """
     lf = log_fn
     if save_fn is None:
         save_fn = lambda f, tag: save_probe_frame(f, tag, log_fn=lf)  # noqa: E731
 
-    flow_cfg = cfg.get("flow", {})
-    mvcfg = dict(flow_cfg.get("mv") or {})
+    mvcfg = dict(flowcfg or {})
     steps = list(mvcfg.get("steps") or [])
     overall = float(mvcfg.get("overall_timeout_sec", 240))
     step_to = float(mvcfg.get("step_timeout_sec", 15))
@@ -1646,8 +1689,8 @@ def run_mv_flow(cfg: dict, *, ctrl, tasker, hwnd, marker_hit_fn, monitor,
     dialog_click_count: dict = {}   # 同一弹窗的自动点击计数（防快速连点；超上限只 WARN 交由超时/重试）
 
     if not steps:
-        lf("MV 流程：flow.mv.steps 为空 → 视为未配置，按失败上报", "WARN")
-        return False, "mv.steps empty"
+        lf(f"{label}：flow.steps 为空 → 视为未配置，按失败上报", "WARN")
+        return False, "steps empty"
 
     # confirm 模板的 (threshold, roi) 从 steps 收集（confirm 通常是下一步页面的按钮）
     tpl_params = {}
@@ -1672,14 +1715,14 @@ def run_mv_flow(cfg: dict, *, ctrl, tasker, hwnd, marker_hit_fn, monitor,
                 template_roi=tuple(lt.get("roi", (860, 630, 340, 90))))
             return hit
         except Exception as exc:  # noqa: BLE001 - 判加载失败按非加载（不阻塞流程，交由正向确认把关）
-            lf(f"MV 流程：加载态判定异常（按非加载）: {exc}", "WARN")
+            lf(f"{label}：加载态判定异常（按非加载）: {exc}", "WARN")
             return False
 
     def _snap():
         try:
             return ctrl.post_screencap().wait().get()
         except Exception as exc:  # noqa: BLE001
-            lf(f"MV 流程：截图失败: {exc}", "WARN")
+            lf(f"{label}：截图失败: {exc}", "WARN")
             return None
 
     def _check_dialog(f2):
@@ -1703,7 +1746,7 @@ def run_mv_flow(cfg: dict, *, ctrl, tasker, hwnd, marker_hit_fn, monitor,
                 continue
             did = str(dlg.get("id", "dialog"))
             lf(f"检测到弹窗[{did}]（{t} 命中），按用户决策自动处理", "WARN")
-            save_fn(f2, f"mv_dialog_{did}")
+            save_fn(f2, f"{tag_prefix}_dialog_{did}")
             ct = (dlg.get("click_template") or [None])[0]
             if not ct:
                 return True
@@ -1732,6 +1775,46 @@ def run_mv_flow(cfg: dict, *, ctrl, tasker, hwnd, marker_hit_fn, monitor,
             return True
         return False
 
+    def _precheck(pc, sid, frame):
+        """★#54★ 点击主按钮前的前置检查（配置驱动，如打歌「常に最大已勾选」）。
+
+        返回 (ok, why)：True=已勾选（或点击勾选框一次后重验恢复）；False=未命中
+        （调用方按配置降级继续 —— 未勾选不危险，只是 LB 消耗非最大，如实记录）。"""
+        pt = (pc.get("template") or [None])[0]
+        if not pt:
+            return True, "no precheck template"
+        pthr = (pc.get("threshold") or [0.75])[0]
+        proi = (pc.get("roi") or [None])[0]
+        if frame is not None and getattr(frame, "size", 0) != 0:
+            hit, _ = _mv_match(tasker, frame, pt, pthr, proi)
+            if hit:
+                return True, f"{pt} already checked"
+        coord = pc.get("coord")
+        if not coord:
+            return False, f"{pt} unchecked and no coord"
+        import numpy as np
+        if frame is None:
+            return False, "precheck screencap invalid"
+        arr = np.asarray(frame)
+        h, w = int(arr.shape[0]), int(arr.shape[1])
+        if abs(w - 1280) > 4 or abs(h - 720) > 4:
+            return False, f"precheck geometry {w}x{h}"
+        try:
+            job = ctrl.post_click(int(coord[0]), int(coord[1]))
+            job.wait()
+        except Exception as exc:  # noqa: BLE001
+            lf(f"{label} precheck 点击异常: {exc}", "WARN")
+            return False, f"precheck click error: {exc}"
+        lf(f"{short} 步骤 {sid}：precheck 未命中 → 已点击勾选框 "
+           f"({coord[0]},{coord[1]})，重新截帧验证")
+        f3 = _snap()
+        if f3 is None or getattr(f3, "size", 0) == 0:
+            return False, "precheck re-verify screencap invalid"
+        hit2, _ = _mv_match(tasker, f3, pt, pthr, proi)
+        if hit2:
+            return True, f"{pt} checked after click"
+        return False, f"{pt} unchecked after click"
+
     def _confirm(confirm, tpl, thr, roi):
         """点击后的正向确认。返回 (ok, why)。★#51★ 每次采样先做弹窗检查钩子。"""
         if confirm == "home":
@@ -1743,7 +1826,7 @@ def run_mv_flow(cfg: dict, *, ctrl, tasker, hwnd, marker_hit_fn, monitor,
                         sleep_fn(interval)
                         continue
                     if not _loading(f2) and marker_hit_fn and marker_hit_fn(f2):
-                        save_fn(f2, "mv_return_home")
+                        save_fn(f2, f"{tag_prefix}_return_home")
                         return True, "home confirmed"
                 sleep_fn(interval)
             return False, (f"home not confirmed within {home_to:.0f}s"
@@ -1780,7 +1863,7 @@ def run_mv_flow(cfg: dict, *, ctrl, tasker, hwnd, marker_hit_fn, monitor,
 
     started = now_fn()
     lf("=" * 62)
-    lf("【MV 自动观看流程】启动（mv_enabled=true；登录已成功；流程失败 → FAIL_MV_FLOW/exit 2）")
+    lf(f"【{label}】启动（登录已成功；流程失败按选项 B 上报 → exit 2）")
     for i, s3 in enumerate(steps, 1):
         lf(f"  步骤{i}: {s3.get('id')} click={s3.get('click')} "
            f"confirm={s3.get('confirm')} tpl={(s3.get('template') or ['-'])[0]}")
@@ -1792,14 +1875,14 @@ def run_mv_flow(cfg: dict, *, ctrl, tasker, hwnd, marker_hit_fn, monitor,
         for idx, st in enumerate(steps, 1):
             sid = str(st.get("id", f"step{idx}"))
             if now_fn() - started >= overall:
-                lf(f"MV 流程整体超时（{overall:.0f}s），中止于 {sid}", "WARN")
+                lf(f"{label}整体超时（{overall:.0f}s），中止于 {sid}", "WARN")
                 return False, f"overall_timeout@{sid}"
             try:
                 if not monitor.alive():
-                    lf("MV 流程：游戏进程已退出，中止", "WARN")
+                    lf(f"{label}：游戏进程已退出，中止", "WARN")
                     return False, f"process_gone@{sid}"
             except Exception as exc:  # noqa: BLE001
-                lf(f"MV 流程：进程存活检查异常（按失联中止）: {exc}", "WARN")
+                lf(f"{label}：进程存活检查异常（按失联中止）: {exc}", "WARN")
                 return False, f"process_check_error@{sid}"
 
             click_kind = str(st.get("click", "box_center"))
@@ -1815,20 +1898,42 @@ def run_mv_flow(cfg: dict, *, ctrl, tasker, hwnd, marker_hit_fn, monitor,
             while attempt <= retry:
                 # ★#49★ 重试期间同样受整体预算约束（截图失败等内层 continue 不绕过 overall）
                 if now_fn() - started >= overall:
-                    lf(f"MV 流程整体超时（{overall:.0f}s），中止于 {sid}（重试期间）", "WARN")
+                    lf(f"{label}整体超时（{overall:.0f}s），中止于 {sid}（重试期间）", "WARN")
                     return False, f"overall_timeout@{sid}"
                 attempt += 1
                 if attempt > 1:
-                    lf(f"MV 步骤 {sid} 第 {attempt}/{retry + 1} 次尝试", "WARN")
+                    lf(f"{short} 步骤 {sid} 第 {attempt}/{retry + 1} 次尝试", "WARN")
                 try:
                     force_foreground(hwnd)
                 except Exception as exc:  # noqa: BLE001
-                    lf(f"MV 步骤 {sid} 置前失败（继续）: {exc}", "WARN")
+                    lf(f"{short} 步骤 {sid} 置前失败（继续）: {exc}", "WARN")
                 frame = _snap()
                 if frame is None or getattr(frame, "size", 0) == 0:
-                    lf(f"MV 步骤 {sid} 截图无效，稍后重试", "WARN")
+                    lf(f"{short} 步骤 {sid} 截图无效，稍后重试", "WARN")
                     ok_step, why = False, "screencap invalid"
                     sleep_fn(0.8)
+                    continue
+
+                # ★#54★ precheck 前置钩子（配置驱动，如打歌「常に最大已勾选」检查）
+                pc = st.get("precheck")
+                if pc:
+                    pc_ok, pc_why = _precheck(pc, sid, frame)
+                    if not pc_ok:
+                        lf(f"{short} 步骤 {sid}：precheck 未命中（{pc_why}）→ "
+                           f"按配置降级继续（如实记录，不中止流程）", "WARN")
+                        save_fn(frame, str(pc.get("miss_tag") or "precheck_miss"))
+                    # 无论 precheck 结果如何都继续点击主按钮（未勾选不危险，只是消耗非最大）
+
+                if click_kind == "none":
+                    # ★#54★ 纯确认步骤（不点击），如打歌第⑧步主界面二次确认
+                    lf(f"{short} 步骤 {sid}：仅确认（不点击）")
+                    ok_step, why = _confirm(confirm, tpl, thr, roi)
+                    if ok_step:
+                        break
+                    save_fn(frame, f"{tag_prefix}_fail_{sid}")
+                    lf(f"{short} 步骤 {sid} 确认失败: {why}（已留图 {tag_prefix}_fail_{sid}）",
+                       "WARN")
+                    sleep_fn(interval)
                     continue
 
                 if click_kind == "coord":
@@ -1836,7 +1941,7 @@ def run_mv_flow(cfg: dict, *, ctrl, tasker, hwnd, marker_hit_fn, monitor,
                     arr = np.asarray(frame)
                     h, w = int(arr.shape[0]), int(arr.shape[1])
                     if abs(w - 1280) > 4 or abs(h - 720) > 4:
-                        lf(f"MV 步骤 {sid} 几何不符 {w}x{h}（应 1280×720±4），"
+                        lf(f"{short} 步骤 {sid} 几何不符 {w}x{h}（应 1280×720±4），"
                            f"跳过坐标点击，绝不按错误坐标乱点", "WARN")
                         ok_step, why = False, f"geometry {w}x{h}"
                         sleep_fn(interval)
@@ -1845,7 +1950,7 @@ def run_mv_flow(cfg: dict, *, ctrl, tasker, hwnd, marker_hit_fn, monitor,
                 else:
                     hit, center = _mv_match(tasker, frame, tpl, thr, roi)
                     if not hit or center is None:
-                        lf(f"MV 步骤 {sid}：{tpl} 未命中（等待/重试）")
+                        lf(f"{short} 步骤 {sid}：{tpl} 未命中（等待/重试）")
                         ok_step, why = False, f"{tpl} not found"
                         sleep_fn(interval)
                         continue
@@ -1855,37 +1960,37 @@ def run_mv_flow(cfg: dict, *, ctrl, tasker, hwnd, marker_hit_fn, monitor,
                     job = ctrl.post_click(int(cx), int(cy))
                     job.wait()
                 except Exception as exc:  # noqa: BLE001
-                    lf(f"MV 步骤 {sid} 点击异常: {exc}", "WARN")
+                    lf(f"{short} 步骤 {sid} 点击异常: {exc}", "WARN")
                     ok_step, why = False, f"click error: {exc}"
                     sleep_fn(interval)
                     continue
-                lf(f"MV 步骤 {sid}：点击 ({cx},{cy})（{click_kind}）")
+                lf(f"{short} 步骤 {sid}：点击 ({cx},{cy})（{click_kind}）")
 
                 ok_step, why = _confirm(confirm, tpl, thr, roi)
                 if ok_step:
                     if post_wait > 0:
-                        lf(f"MV 步骤 {sid}：确认成功，等待 {post_wait:.1f}s（MV 载入/过渡）")
+                        lf(f"{short} 步骤 {sid}：确认成功，等待 {post_wait:.1f}s（载入/过渡）")
                         sleep_fn(post_wait)
                     break
-                save_fn(frame, f"mv_fail_{sid}")
-                lf(f"MV 步骤 {sid} 确认失败: {why}（已留图 mv_fail_{sid}）", "WARN")
+                save_fn(frame, f"{tag_prefix}_fail_{sid}")
+                lf(f"{short} 步骤 {sid} 确认失败: {why}（已留图 {tag_prefix}_fail_{sid}）", "WARN")
                 sleep_fn(interval)
 
             if not ok_step:
-                lf(f"MV 步骤 {sid} 重试耗尽（{retry + 1} 次），MV 流程失败", "WARN")
+                lf(f"{short} 步骤 {sid} 重试耗尽（{retry + 1} 次），{label}失败", "WARN")
                 return False, f"{sid}: {why}"
-            lf(f"MV 步骤 {sid} ✔ {why}")
+            lf(f"{short} 步骤 {sid} ✔ {why}")
 
-        lf("【MV 自动观看流程】全部步骤完成，已回到主界面", "OK")
+        lf(f"【{label}】全部步骤完成，已回到主界面", "OK")
         return True, "all steps done"
     except Exception as exc:  # noqa: BLE001 - 意外异常：留图+WARN 后向上抛，由 _finish_ok 吞掉
         try:
             frame = _snap()
             if frame is not None and getattr(frame, "size", 0) != 0:
-                save_fn(frame, "mv_fail_exception")
+                save_fn(frame, f"{tag_prefix}_fail_exception")
         except Exception:  # noqa: BLE001
             pass
-        lf(f"MV 流程异常（已留图 mv_fail_exception，向上抛出由收口逻辑吞掉）: "
+        lf(f"{label}异常（已留图 {tag_prefix}_fail_exception，向上抛出由收口逻辑吞掉）: "
            f"{type(exc).__name__}: {exc}", "WARN")
         raise
 
@@ -2015,24 +2120,47 @@ def run(cfg: dict, skip_launch: bool = False) -> tuple[bool, str]:
               意外异常一律吞掉+WARN，仍 return True, OK_MARKER（不把登录成功降级）。
             """
             global _LAST_MV_STAT          # ★#48★ 采集统计透传给结果文件
-            # ★#49★ 双开关都关（默认）→ 直接返回，不截图/不留图/不写日志/不改变时序（逐字零回归）
-            if not mv_explore_enabled(cfg) and not mv_flow_enabled(cfg):
+            # ★#49/#54★ 三开关都关（默认）→ 直接返回，不截图/不留图/不写日志/不改变时序（逐字零回归）
+            if (not mv_explore_enabled(cfg) and not mv_flow_enabled(cfg)
+                    and not play_flow_enabled(cfg)):
                 return True, OK_MARKER
             if not mv_explore_enabled(cfg):
-                # ★#49★ mv_enabled=true：MV 自动观看流程（登录已成功；业务失败按选项 B 上报）
-                try:
-                    ok_mv, why_mv = run_mv_flow(
-                        cfg, ctrl=ctrl, tasker=tasker, hwnd=hwnd,
-                        marker_hit_fn=marker_hit_fn, monitor=monitor)
-                except Exception as exc:  # noqa: BLE001 - 意外异常吞掉，不把登录成功降级
-                    log(f"MV 流程异常（已忽略，登录结果不变）: {type(exc).__name__}: {exc}", "WARN")
-                    return True, OK_MARKER
-                if ok_mv:
-                    log("MV 自动观看流程完成（登录结果不变）", "OK")
-                    return True, OK_MARKER
-                log(f"MV 自动观看流程失败: {why_mv}（登录已成功；按 #34 §5.3 选项 B 上报 "
-                    f"FAIL_MV_FLOW → exit 2）", "WARN")
-                return False, FAIL_MV_FLOW
+                # ★#49/#54★ 自动流程分支（登录已成功；业务失败按选项 B 上报 → exit 2）
+                # ★#54★ mv_enabled 与 play_enabled 同时开启 → 互斥，MV 优先（写死，见 README §16.3）
+                if mv_flow_enabled(cfg):
+                    if play_flow_enabled(cfg):
+                        log("mv_enabled 与 play_enabled 同时开启：互斥，本次执行 MV 流程、"
+                            "跳过打歌流程（如需打歌请单独开启）", "WARN")
+                    try:
+                        ok_mv, why_mv = run_mv_flow(
+                            cfg, ctrl=ctrl, tasker=tasker, hwnd=hwnd,
+                            marker_hit_fn=marker_hit_fn, monitor=monitor)
+                    except Exception as exc:  # noqa: BLE001 - 意外异常吞掉，不把登录成功降级
+                        log(f"MV 流程异常（已忽略，登录结果不变）: {type(exc).__name__}: {exc}",
+                            "WARN")
+                        return True, OK_MARKER
+                    if ok_mv:
+                        log("MV 自动观看流程完成（登录结果不变）", "OK")
+                        return True, OK_MARKER
+                    log(f"MV 自动观看流程失败: {why_mv}（登录已成功；按 #34 §5.3 选项 B 上报 "
+                        f"FAIL_MV_FLOW → exit 2）", "WARN")
+                    return False, FAIL_MV_FLOW
+                if play_flow_enabled(cfg):
+                    try:
+                        ok_pl, why_pl = run_play_flow(
+                            cfg, ctrl=ctrl, tasker=tasker, hwnd=hwnd,
+                            marker_hit_fn=marker_hit_fn, monitor=monitor)
+                    except Exception as exc:  # noqa: BLE001 - 意外异常吞掉，不把登录成功降级
+                        log(f"打歌流程异常（已忽略，登录结果不变）: {type(exc).__name__}: {exc}",
+                            "WARN")
+                        return True, OK_MARKER
+                    if ok_pl:
+                        log("自動打歌（跳过模式）流程完成（登录结果不变）", "OK")
+                        return True, OK_MARKER
+                    log(f"自動打歌（跳过模式）流程失败: {why_pl}（登录已成功；按 #34 §5.3 选项 B "
+                        f"上报 FAIL_PLAY_FLOW → exit 2）", "WARN")
+                    return False, FAIL_PLAY_FLOW
+                return True, OK_MARKER
             try:
                 log(f"MV 探索采集：登录已确认（入口[{when}]），开始旁路只读采集"
                     f"（登录结果不变）")
@@ -2058,9 +2186,9 @@ def run(cfg: dict, skip_launch: bool = False) -> tuple[bool, str]:
                 log(f"★MV 探索采集未正常执行（异常），素材未采到，需重跑★: "
                     f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
                     f"（登录结果不变）", "WARN")
-            if mv_flow_enabled(cfg):
-                log("mv_enabled 与 mv_explore 同时开启：采集（用户手动）优先，"
-                    "本次跳过 MV 自动观看流程", "WARN")
+            if mv_flow_enabled(cfg) or play_flow_enabled(cfg):
+                log("mv_enabled/play_enabled 与 mv_explore 同时开启：采集（用户手动）优先，"
+                    "本次跳过自动流程", "WARN")
             return True, OK_MARKER
 
         def _direct_confirm(when: str) -> bool:
@@ -3320,8 +3448,9 @@ def static_self_check(cfg: dict) -> bool:
             "#39 三处 OK_MARKER 返回必须全部改为 return _finish_ok(...)（漏一处直判会跳过采集）"
         assert "\n                return True, OK_MARKER" in finish_body, \
             "#39/#49 双关闭分支须直接 return True, OK_MARKER（16 空格）"
+        # ★#54 适配★ _finish_ok 现分流 mv_explore/mv/play，锚点改三关闭合并分支，意图不变
         idx_both26 = finish_body.index(
-            "if not mv_explore_enabled(cfg) and not mv_flow_enabled(cfg):")
+            "if (not mv_explore_enabled(cfg) and not mv_flow_enabled(cfg)")
         idx_default26 = finish_body.index("return True, OK_MARKER", idx_both26)
         idx_log26 = finish_body.index("log(", idx_both26)
         idx_cap26 = finish_body.index("screencap_fn=")
@@ -3573,15 +3702,17 @@ def static_self_check(cfg: dict) -> bool:
         body28 = src28[src28.index("def _finish_ok("):src28.index("def _direct_confirm(")]
         assert "run_mv_flow(" in body28 and "FAIL_MV_FLOW" in body28 \
                and "mv_flow_enabled(cfg)" in body28, "#49 _finish_ok 须接入 MV 自动观看分支"
-        assert "mv_enabled 与 mv_explore 同时开启" in body28, "#49 双开互斥须 WARN"
+        assert "run_play_flow(" in body28 and "FAIL_PLAY_FLOW" in body28 \
+               and "play_flow_enabled(cfg)" in body28, "#54 _finish_ok 须接入打歌分支"
+        assert "与 mv_explore 同时开启" in body28, "#49 采集优先互斥须 WARN"
         loop28 = src28[src28.index("def run_mv_flow("):src28.index("def run(cfg: dict")]
         assert "force_foreground(hwnd)" in loop28 and "post_click" in loop28, \
             "#49 每步须置前后点击"
-        assert "mv_fail_" in loop28 and "mv_return_home" in loop28, \
-            "#49 失败/回主页留图 tag 须存在"
+        assert "{tag_prefix}_fail_" in loop28 and "{tag_prefix}_return_home" in loop28, \
+            "#49/#54 失败/回主页留图 tag 须存在（tag_prefix 拼接）"
         assert "1280" in loop28 and "720" in loop28, "#49 coord 步须 1280×720±4 几何守卫"
         assert "未知" in loop28, "#49 未知弹窗段须按『未知』处理（绝不脑补点击）"
-        assert "_check_dialog" in loop28 and "mv_dialog_" in loop28 \
+        assert "_check_dialog" in loop28 and "{tag_prefix}_dialog_" in loop28 \
                and "dialog_check" in loop28, \
             "#51 确认等待中的弹窗检查钩子（_check_dialog）须存在且接入"
 
@@ -3632,6 +3763,139 @@ def static_self_check(cfg: dict) -> bool:
               "_check_dialog 钩子接入确认循环★")
     except Exception as exc:
         failures.append(f"#49 MV 自动观看流程检查失败: {exc}")
+
+    # 29) ★#54★ 自动打歌（跳过模式）流程：配置/模板/默认关闭/互斥/precheck/三态/失败路径真调用
+    try:
+        src54 = (BASE_DIR / "main.py").read_text(encoding="utf-8")
+        # (a) 默认关闭 + 缺 key 兼容 + --play-enabled 仅内存覆盖
+        assert play_flow_enabled(cfg) is False, "#54 play_enabled 必须默认 false"
+        assert play_flow_enabled({"flow": {}}) is False, "#54 缺 key 必须按 false 处理"
+        main_body54 = src54[src54.index("\ndef main(argv=None) -> int:") + 1:]
+        assert 'add_argument("--play-enabled"' in main_body54 \
+               and "args.play_enabled" in main_body54 \
+               and 'cfg["flow"]["play_enabled"] = True' in main_body54, \
+            "#54 --play-enabled 开关须存在并做内存覆盖"
+        assert not any(k in main_body54 for k in
+                       ("write_text", "json.dump", "CONFIG_FILE", "open(")), \
+            "#54 --play-enabled 仅内存覆盖，绝不写盘"
+
+        # (b) 配置结构：8 步 id / 超时参数 / 7 张模板存在+尺寸 / 阈值≥0.55 / confirm 链 / precheck
+        pcfg54 = cfg["flow"]["play"]
+        steps54 = pcfg54["steps"]
+        assert [s54["id"] for s54 in steps54] == [
+            "1_click_live", "2_click_decide", "3_click_skip", "4_dialog_start",
+            "5_click_ok", "6_back_team", "7_back_song", "8_confirm_home"], \
+            "#54 八步 id 须完整"
+        assert float(pcfg54["overall_timeout_sec"]) > 0 \
+               and float(pcfg54["step_timeout_sec"]) > 0 \
+               and int(pcfg54["step_retry"]) >= 0 \
+               and float(pcfg54["return_home_confirm_sec"]) > 0, "#54 超时/重试参数须有效"
+        for t54, (w54, h54) in {
+                "play_decide_button.png": (195, 52), "play_skip_button.png": (115, 30),
+                "play_start_button.png": (205, 52), "play_ok_button.png": (200, 42),
+                "play_dialog_title.png": (258, 30), "play_result_title.png": (326, 29),
+                "play_max_checked.png": (60, 33)}.items():
+            p54 = IMAGE_DIR / t54
+            assert p54.is_file(), f"#54 模板缺失: {t54}"
+            with open(p54, "rb") as fh54:
+                head54 = fh54.read(33)
+            assert struct.unpack(">II", head54[16:24]) == (w54, h54), \
+                f"#54 模板 {t54} 尺寸须为 {w54}x{h54}"
+        for s54 in steps54:
+            for th54 in (s54.get("threshold") or []):
+                assert float(th54) >= 0.55, f"#54 阈值严禁 <0.55（{s54['id']}={th54}）"
+        assert steps54[0]["template"][0] == "home_nav_bottom_right.png", \
+            "#54 第①步须复用主界面 Live 模板"
+        assert steps54[5]["template"][0] == "mv_back_button.png" \
+               and steps54[6]["template"][0] == "mv_back_button.png", \
+            "#54 两次返回须复用 mv_back_button"
+        assert steps54[7].get("click") == "none", "#54 第⑧步须为纯确认步（click=none）"
+        pc54 = steps54[3].get("precheck")
+        assert pc54 and pc54["template"][0] == "play_max_checked.png" \
+               and pc54["coord"] and pc54.get("miss_tag") == "play_max_unchecked", \
+            "#54 第④步须带『常に最大已勾选』precheck（未命中降级继续）"
+        assert [s54.get("confirm") for s54 in steps54] == [
+            "play_decide_button.png", "play_skip_button.png", "play_dialog_title.png",
+            "play_result_title.png", "play_skip_button.png",
+            "play_decide_button.png", "home", "home"], "#54 confirm 链须完整"
+
+        # (c) _finish_ok：play 分支接入 + 三关闭分支 + 双开互斥（mv 优先）
+        finish54 = src54[src54.index("def _finish_ok("):src54.index("def _direct_confirm(")]
+        assert "run_play_flow(" in finish54 and "FAIL_PLAY_FLOW" in finish54, \
+            "#54 _finish_ok 须接入打歌分支"
+        assert "mv_enabled 与 play_enabled 同时开启" in finish54, \
+            "#54 mv/play 双开须互斥 WARN（MV 优先）"
+        assert "if (not mv_explore_enabled(cfg) and not mv_flow_enabled(cfg)" in finish54 \
+               and "and not play_flow_enabled(cfg)" in finish54, \
+            "#54 三关闭合并分支须存在（默认零回归）"
+        generic54 = src54[src54.index("def _run_flow_generic("):src54.index("def run(cfg: dict")]
+        assert "precheck" in generic54 and "click_kind == \"none\"" in generic54, \
+            "#54 通用执行器须支持 precheck 钩子与 click=none 纯确认步"
+
+        # (d) 三态不受影响：FAIL_PLAY_FLOW → exit 2；0/3/2 不变
+        nop54 = lambda *a, **k: None  # noqa: E731
+        assert report_result(FAIL_PLAY_FLOW, log_fn=nop54) == 2, "#54 FAIL_PLAY_FLOW 须 exit 2"
+        assert report_result(OK_MARKER, log_fn=nop54) == 0 \
+               and report_result(OK_DEGRADED_UNVERIFIED, log_fn=nop54) == 3 \
+               and report_result(FAIL_NOT_CONFIRMED, log_fn=nop54) == 2, "#54 三态 0/3/2 不受影响"
+
+        # (e) schema v2：flow 字段（play 场景 flow=="play"；双开互斥 flow=="mv"）；login_ok 分离
+        c54 = json.loads(json.dumps(cfg))
+        c54["flow"]["play_enabled"] = True
+        import tempfile, shutil
+        tmp54 = Path(tempfile.mkdtemp(prefix="play_flow_"))
+        r54a = write_result_files(c54, ok=False, reason=FAIL_PLAY_FLOW, exit_code=2,
+                                  duration_sec=1.0, out_dir=tmp54, mv_stat=None)
+        assert r54a["schema_version"] == 2 and r54a["flow"] == "play" \
+               and r54a["login_ok"] is True and r54a["exit_code"] == 2, \
+            "#54 schema v2 flow 字段 + login_ok 分离须成立（play 场景）"
+        c54b = json.loads(json.dumps(cfg))
+        c54b["flow"]["play_enabled"] = True
+        c54b["flow"]["mv_enabled"] = True
+        r54b = write_result_files(c54b, ok=False, reason=FAIL_MV_FLOW, exit_code=2,
+                                  duration_sec=1.0, out_dir=tmp54, mv_stat=None)
+        assert r54b["flow"] == "mv", "#54 双开互斥：结果文件 flow 须为 mv（MV 优先）"
+        assert r54b["login_ok"] is True
+        shutil.rmtree(tmp54, ignore_errors=True)
+
+        # (f) 行为：真实 run_play_flow + mock 控制器（模板全不命中）→ 安全失败
+        class _Job54:
+            def __init__(self, v):
+                self._v = v
+
+            def wait(self):
+                return self
+
+            def get(self):
+                return self._v
+
+        class _Ctrl54:
+            def post_screencap(self):
+                import numpy as np
+                return _Job54(np.zeros((720, 1280, 3), np.uint8))
+
+            def post_click(self, x, y):
+                return _Job54(True)
+
+        class _Mon54:
+            def alive(self):
+                return True
+
+        st54 = run_play_flow(cfg, ctrl=_Ctrl54(), tasker=None, hwnd=None,
+                             marker_hit_fn=None, monitor=_Mon54(),
+                             sleep_fn=lambda s: None, now_fn=lambda: 0.0,
+                             save_fn=lambda f, tag: "")
+        assert st54[0] is False and "1_click_live" in st54[1], \
+            f"#54 打歌失败路径须安全返回 (False, why)，实际 {st54}"
+
+        print("[29] ★#54 自动打歌流程 OK★: play_enabled 默认 false、八步 id/confirm 链/precheck 完整、"
+              "7 张模板存在且尺寸正确、阈值全部 ≥0.55、--play-enabled 仅内存覆盖不落盘；"
+              "_finish_ok play 分支接入（失败→FAIL_PLAY_FLOW、异常吞掉、双开互斥 mv 优先 WARN、"
+              "三关闭零回归分支存在）；generic 支持 precheck 钩子与 click=none；"
+              "schema v2 flow 字段（play 场景 flow=play、双开 flow=mv）+ login_ok 分离；"
+              "FAIL_PLAY_FLOW→exit 2 且三态 0/3/2 不变；mock 失败路径真调用安全返回")
+    except Exception as exc:
+        failures.append(f"#54 自动打歌流程检查失败: {exc}")
 
     print("-" * 70)
     if failures:
@@ -3707,20 +3971,35 @@ def write_result_files(cfg: dict, *, ok: bool, reason: str, exit_code: int,
     ecfg = flow.get("mv_explore_cfg", {}) or {}
     mode = "mv_explore" if mv_explore_enabled(cfg) else "login"
     stat = dict(mv_stat if mv_stat is not None else (_LAST_MV_STAT or {}))
+    # ★#54★ schema v2：新增 flow 字段（实际执行的附加流程），mode 保留旧语义向后兼容
+    #   flow: "none" / "mv_explore"（采集） / "mv"（自动观看） / "play"（自动打歌）
+    #   互斥优先级与 _finish_ok 一致：采集 > mv > play
+    if mv_explore_enabled(cfg):
+        flow_kind = "mv_explore"
+    elif play_flow_enabled(cfg) and not mv_flow_enabled(cfg):
+        flow_kind = "play"
+    elif mv_flow_enabled(cfg):
+        flow_kind = "mv"
+    else:
+        flow_kind = "none"
 
     result = {
-        "schema_version": 1,
+        "schema_version": 2,
         "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
         "duration_sec": round(float(duration_sec), 3),
         "exit_code": int(exit_code),
         "verdict": reason,
         "terminal_text": _terminal_text_from_ring(),
         "mode": mode,
+        "flow": flow_kind,
         # ★#51★ FAIL_MV_FLOW 时 run() 返回 (False, FAIL_MV_FLOW)，但登录本身已 OK_MARKER 成功
         #（19:22:19 实测）—— login_ok 表达「登录是否成功」，不得被 MV 附加流程结果覆盖。
-        "login_ok": bool(ok) or reason == FAIL_MV_FLOW,
+        # ★#54★ FAIL_PLAY_FLOW 时登录同样已成功，login_ok 一并不被附加流程结果覆盖
+        "login_ok": bool(ok) or reason in (FAIL_MV_FLOW, FAIL_PLAY_FLOW),
         "config_snapshot": {
             "mv_explore": bool(flow.get("mv_explore", False)),
+            "mv_enabled": bool(flow.get("mv_enabled", False)),
+            "play_enabled": bool(flow.get("play_enabled", False)),
             "max_frames": ecfg.get("max_frames"),
             "max_duration_sec": ecfg.get("max_duration_sec"),
             "sample_interval_sec": ecfg.get("sample_interval_sec"),
@@ -3766,6 +4045,8 @@ def main(argv=None) -> int:
                     help="只读旁观采集 MV 六步界面素材（仅内存覆盖 mv_explore=true，不落盘）")
     ap.add_argument("--mv-enabled", action="store_true",
                     help="登录成功后自动观看 MV（仅内存覆盖 mv_enabled=true，不落盘）")
+    ap.add_argument("--play-enabled", action="store_true",
+                    help="登录成功后自动打歌（跳过模式）（仅内存覆盖 play_enabled=true，不落盘）")
     args = ap.parse_args(argv)
 
     cfg = load_settings()
@@ -3779,6 +4060,9 @@ def main(argv=None) -> int:
     # ★#49★ 同上：--mv-enabled 仅内存覆盖 flow.mv_enabled，绝不写盘。
     if args.mv_enabled:
         cfg["flow"]["mv_enabled"] = True
+    # ★#54★ 同上：--play-enabled 仅内存覆盖 flow.play_enabled，绝不写盘。
+    if args.play_enabled:
+        cfg["flow"]["play_enabled"] = True
 
     t0_48 = time.monotonic()
     _ok, reason = run(cfg, skip_launch=args.skip_launch)

@@ -282,6 +282,84 @@
                     "note": "★#51★ 「放弃中断Live确认」弹窗：正文=『由于其他设备存在中断中的Live，无法继续。要放弃中断中的数据吗？』+红字『已消耗的LB和道具不会返还』。用户已明确决策：自动点右侧红色「放 弃」继续；左侧白色「返回标题」绝不自动点。模板与阈值依据（38-ncc.py 同口径）：discard 正 0.948 / 真负 max 0.337（10 张 mv_explore 帧+标题+主界面+加载页）→ 0.75；title 正 1.000 / 真负 max 0.408 → 0.75。弹窗背景是模糊主界面，已验证在无弹窗的主界面/乐曲选择帧上零误命中。弹窗出现时留图 tag=mv_dialog_<id>（只新增不覆盖）。点「放 弃」后弹窗仍在/确认仍超时 → 走既有失败路径（retry→FAIL_MV_FLOW），不无限循环。严禁下调阈值。"
                 }
             ]
+        },
+        "play_enabled": false,
+        "play": {
+            "note": "★#54★ 自动打歌（跳过模式）流程。八步语义（按 20.15~20.16 真实采集素材目视确认）：①主界面点 Live → ②乐曲选择页点右下「決定」 → ③队伍确认页点右下「跳过」（模板只裁『跳过』文字区，避开会变的『剩余N次』数字；已在剩余 9/10/8 次三帧上全部验证命中）→ ④スキップライブ確認弹窗：precheck「常に最大已勾选」（未命中按 coord 点勾选框一次后重验，仍未命中 WARN+留图 play_max_unchecked 并★降级继续点開始★——未勾选不危险，只是 LB 消耗非最大）→ 点「開 始」 → ⑤結果页点「OK」 → ⑥队伍确认页点 ◀ → ⑦乐曲选择页点 ◀ → ⑧主界面确认（marker 三模板 + 留图 play_return_home）。★模板与阈值依据（40-ncc.py 同口径）★ decide：正 0.893~0.970、真负 max 0.608 → 0.75；skip：正 0.973~1.000（三种数字全过）、真负 max 0.714（弹窗收起态形似）→ 0.85；start：正 1.000、真负 0.443 → 0.75；ok：正 0.894~1.000、真负 0.385 → 0.75；dialog_title：正 1.000×2、真负 0.479 → 0.75；result_title：正 0.946~1.000、真负 0.338 → 0.75；max_checked：正 0.972/0.974、真负 0.599 → 0.80。★back 阈值依据（40-ncc.py + 40-back-probe.log）★ mv_back_button 在打歌乐曲选择页 0.994/0.997、队伍确认页 0.800/0.838/0.786（◀ 与 MV 版有细微差异）、打歌主界面 0001 仅 0.548 → play 段取 0.75（负样本上界 0.548，余量 +0.20）；mv 段维持 0.8 不变。★与 mv_enabled 互斥★ 同时开启时 MV 优先（_finish_ok 写死），WARN 提示；如需打歌请单独开启。★未知项（按未知处理，绝不脑补）★ 常に最大未勾选态零素材（precheck 按降级设计）；跳过剩余 0 次时点跳过的行为未知（安全中止）；LB=0 时流程会在某步失败（安全中止，LB 道具恢复明确不做）；結果页 SS 评级/偶像数值为动态内容严禁裁模板；0021~0022 的 LB 恢复弹窗素材不作实现依据。★严禁下调阈值★。弹窗内「取消」、队伍确认页「自动 剩余20次」粉钮一律不点。",
+            "overall_timeout_sec": 300,
+            "step_timeout_sec": 15,
+            "step_retry": 2,
+            "return_home_confirm_sec": 20,
+            "steps": [
+                {
+                    "id": "1_click_live",
+                    "template": ["home_nav_bottom_right.png"],
+                    "threshold": [0.55],
+                    "roi": [[1040, 570, 240, 150]],
+                    "click": "box_center",
+                    "confirm": "play_decide_button.png"
+                },
+                {
+                    "id": "2_click_decide",
+                    "template": ["play_decide_button.png"],
+                    "threshold": [0.75],
+                    "roi": [[1030, 630, 250, 90]],
+                    "click": "box_center",
+                    "confirm": "play_skip_button.png"
+                },
+                {
+                    "id": "3_click_skip",
+                    "template": ["play_skip_button.png"],
+                    "threshold": [0.85],
+                    "roi": [[1090, 630, 190, 90]],
+                    "click": "box_center",
+                    "confirm": "play_dialog_title.png"
+                },
+                {
+                    "id": "4_dialog_start",
+                    "template": ["play_start_button.png"],
+                    "threshold": [0.75],
+                    "roi": [[620, 630, 260, 90]],
+                    "click": "box_center",
+                    "confirm": "play_result_title.png",
+                    "precheck": {
+                        "template": ["play_max_checked.png"],
+                        "threshold": [0.8],
+                        "roi": [[420, 340, 130, 90]],
+                        "coord": [479, 380],
+                        "miss_tag": "play_max_unchecked"
+                    }
+                },
+                {
+                    "id": "5_click_ok",
+                    "template": ["play_ok_button.png"],
+                    "threshold": [0.75],
+                    "roi": [[500, 640, 280, 80]],
+                    "click": "box_center",
+                    "confirm": "play_skip_button.png"
+                },
+                {
+                    "id": "6_back_team",
+                    "template": ["mv_back_button.png"],
+                    "threshold": [0.75],
+                    "roi": [[0, 630, 110, 90]],
+                    "click": "box_center",
+                    "confirm": "play_decide_button.png"
+                },
+                {
+                    "id": "7_back_song",
+                    "template": ["mv_back_button.png"],
+                    "threshold": [0.75],
+                    "roi": [[0, 630, 110, 90]],
+                    "click": "box_center",
+                    "confirm": "home"
+                },
+                {
+                    "id": "8_confirm_home",
+                    "click": "none",
+                    "confirm": "home"
+                }
+            ]
         }
     }
 }
