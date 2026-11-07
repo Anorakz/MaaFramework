@@ -51,6 +51,7 @@ import os
 import struct
 import sys
 import time
+import datetime
 from ctypes import wintypes
 from pathlib import Path
 
@@ -101,6 +102,7 @@ FAIL_OVERALL_TIMEOUT = "OVERALL_TIMEOUT"
 FAIL_MAX_RESTARTS = "MAX_RESTARTS_EXCEEDED"
 FAIL_DETERMINISTIC = "DETERMINISTIC_FAILURE"  # 第3次同窗退出，停止重试并上报
 FAIL_STABLE_TIMEOUT = "STABLE_CONFIRM_TIMEOUT"  # 点击后加载态迟迟不结束，稳定复检超时
+FAIL_MV_FLOW = "MV_FLOW_FAILED"  # ★#49★ 登录已成功但 MV 自动观看流程失败（选项 B → exit 2）
 FAIL_NOT_CONFIRMED = "NOT_CONFIRMED"  # ★#18★ 未观察到加载态、也无正向主界面标志 → 不得判成功
 
 ELEVATION_HINT = (
@@ -120,8 +122,17 @@ ELEVATION_HINT = (
 # --------------------------------------------------------------------------- #
 # 日志（自有日志 debug/agent.log；框架日志 debug/maafw.log 由 init_option 生成）
 # --------------------------------------------------------------------------- #
+# ★#48★ 最近 30 条日志行的内存环形缓存（仅供 debug/last_result.json 的 key_log_lines
+# 与 terminal_text 读取；不改 log 的输出行为 —— print + 写文件保持原样，零回归）。
+_LOG_RING: list[str] = []
+_LOG_RING_MAX = 30
+
+
 def log(msg: str, level: str = "INFO") -> None:
     line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}][{level}] {msg}"
+    _LOG_RING.append(line)
+    if len(_LOG_RING) > _LOG_RING_MAX:
+        del _LOG_RING[0]
     print(line, flush=True)
     try:
         DEBUG_DIR.mkdir(parents=True, exist_ok=True)
@@ -1375,6 +1386,510 @@ def direct_marker_confirm(frame, cfg: dict, marker_hit_fn, *, log_fn=None, probe
     return True
 
 
+# --------------------------------------------------------------------------- #
+# ★#39★ MV 探索性实跑采集模式（方案 B）：只读旁观、逐帧差分去重留图
+#   设计铁律：flow.mv_explore 默认 false，关闭时 _finish_ok 直接返回 OK_MARKER，
+#   不截图、不留图、不写任何日志、不改变时序 → 对两轮实跑验证的登录链路逐字零回归。
+#   开启时仅在「登录已确认成功」后于同一会话内旁路采集，绝不点击/改判定/动三态。
+#   screencap_fn / is_alive_fn / save_fn / sleep_fn / now_fn 全部可注入，
+#   供 .workbuddy/artifacts/31-verify.py 用合成帧序列离线驱动（无需真实控制器）。
+# --------------------------------------------------------------------------- #
+def mv_explore_enabled(cfg: dict) -> bool:
+    """采集模式总开关：flow.mv_explore 默认 false（key 缺失亦为 false，兼容旧配置）。"""
+    return bool(cfg.get("flow", {}).get("mv_explore", False))
+
+
+def _mv_frame_signature(frame, *, step: int, expected_w: int, expected_h: int,
+                        tol: int, black_mean_max: float):
+    """返回 (small_gray, ok, why)：small_gray 为降采样灰度浮点矩阵（帧差基准）。
+
+    ok=False 表示该帧疑似『终端被截到 / 全黑 / 尺寸不符』，必须跳过、不得当有效素材存下，
+    也不得更新差分基准。仅用尺寸 + 极暗均值判据（不识别终端内容，避免引入模板/误判）。
+    """
+    import numpy as np
+    if frame is None or getattr(frame, "size", 0) == 0:
+        return None, False, "空帧"
+    arr = np.asarray(frame)
+    if arr.ndim != 3 or arr.shape[2] != 3:
+        return None, False, f"维度/通道不符 shape={arr.shape}"
+    h, w = int(arr.shape[0]), int(arr.shape[1])
+    if abs(w - expected_w) > tol or abs(h - expected_h) > tol:
+        return None, False, f"尺寸不符 {w}x{h}（应为 {expected_w}x{expected_h}±{tol}）"
+    small = arr[::step, ::step, :].astype(np.float32).mean(axis=2)
+    if float(small.mean()) < black_mean_max:
+        return None, False, "全黑/极暗帧"
+    return small, True, ""
+
+
+def mv_explore_loop(cfg: dict, *, screencap_fn, is_alive_fn, save_fn,
+                    log_fn=log, sleep_fn=time.sleep, now_fn=time.monotonic) -> dict:
+    """★#39★ 登录确认成功后的旁路采集：只读旁观，绝不触碰游戏。
+
+    只用 screencap_fn() 取帧、save_fn(frame, tag) 留图、is_alive_fn() 判进程；
+    绝不点击、发任务、做识别、停任务、抢窗口焦点、重启游戏、改阈值、进登录兜底。
+    结束条件：Ctrl+C（优雅收尾，不吞掉后继续跑）、总时长上限、最大留图数、
+    或进程消失。任何情况结束后都返回统计 dict，调用方仍返回 OK_MARKER/exit 0。
+    """
+    import numpy as np
+    stat = {"enabled": False, "seen": 0, "saved": 0, "skipped": 0,
+            "bad_frames": 0, "stop_reason": "disabled", "files": [], "frame_meta": []}
+    if not mv_explore_enabled(cfg):
+        return stat                       # ★关闭：零截图/零留图/零日志/零副作用★
+    stat["enabled"] = True
+
+    ec = dict(cfg.get("flow", {}).get("mv_explore_cfg") or {})
+    interval = float(ec.get("sample_interval_sec", 0.9))
+    max_duration = float(ec.get("max_duration_sec", 180))
+    diff_thr = float(ec.get("frame_diff_threshold", 12.0))
+    max_frames = int(ec.get("max_frames", 60))
+    only_changed = bool(ec.get("only_changed_frames", True))
+    expected_w = int(ec.get("expected_width", 1280))
+    expected_h = int(ec.get("expected_height", 720))
+    tol = int(ec.get("geometry_tolerance", 4))
+    black_mean_max = float(ec.get("black_mean_max", 12.0))
+    warn_after = max(1, int(ec.get("bad_frame_warn_after", 3)))
+    step = max(1, int(ec.get("diff_downsample_step", 8)))
+
+    log_fn("=" * 62)
+    log_fn("【MV 探索性实跑采集模式】已启动（只旁观截图，不点击、不改判定、不改三态）")
+    log_fn("请在游戏里手动依次完成六步：")
+    log_fn("  1) 点击主界面右下角 Live")
+    log_fn("  2) 点击「观看 MV」")
+    log_fn("  3) 点击「开始」")
+    log_fn("  4) 点击屏幕唤起控制页")
+    log_fn("  5) 点右上角最右边的快进键退出 MV")
+    log_fn("  6) 点左下角返回键回到主页面")
+    log_fn("★期间请把【管理员终端最小化】、保持游戏窗口在前台★", "WARN")
+    log_fn("  （Foreground 截图依赖游戏窗口前台；终端被切到前台时可能截到终端/黑帧，")
+    log_fn("   脚本会自动跳过并 WARN，但那几秒可能丢素材；切回终端按 Ctrl+C 前采集可能已结束）")
+    log_fn("★MV 播放段请尽快完成第 4/5/6 步，不要等 MV 播完★"
+           "（视频段每帧都变，留图额度消耗最快）", "WARN")
+    log_fn("采集上限已放宽；回传前请按 0001..N 顺序目视剔除重复帧与终端/桌面帧。")
+    log_fn("走完六步后切回终端按 Ctrl+C 结束；或等待自动结束（时长/留图数上限 / 游戏退出）。")
+    log_fn("★收尾若打印 stop_reason=max_frames，说明额度耗尽、素材未采全，需重跑★", "WARN")
+    log_fn(f"采样 {interval}s/帧，最长 {max_duration:.0f}s，最多留 {max_frames} 张；"
+           f"差分阈值 {diff_thr:g}，仅变化帧留图={only_changed}")
+    log_fn("=" * 62)
+
+    started = now_fn()
+    prev_small = None
+    consecutive_bad = 0
+    warned_bad = False
+    seq = 0
+    stop_reason = "max_duration"
+    try:
+        while True:
+            if now_fn() - started >= max_duration:
+                stop_reason = "max_duration"
+                break
+            if stat["saved"] >= max_frames:
+                stop_reason = "max_frames"
+                break
+            try:
+                if not is_alive_fn():
+                    stop_reason = "process_gone"
+                    break
+            except Exception as exc:  # noqa: BLE001 - 存活检查异常按失联收尾
+                log_fn(f"MV 采集：进程存活检查异常（按失联收尾）: {exc}", "WARN")
+                stop_reason = "process_gone"
+                break
+
+            # 只读取帧；★不抢窗口焦点★（会干扰用户手动点击）
+            try:
+                frame = screencap_fn()
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                log_fn(f"MV 采集：取帧失败（跳过本帧）: {exc}", "WARN")
+                frame = None
+            stat["seen"] += 1
+
+            small, ok, why = _mv_frame_signature(
+                frame, step=step, expected_w=expected_w, expected_h=expected_h,
+                tol=tol, black_mean_max=black_mean_max)
+            if not ok:
+                stat["skipped"] += 1
+                stat["bad_frames"] += 1
+                consecutive_bad += 1
+                if consecutive_bad >= warn_after and not warned_bad:
+                    log_fn(f"MV 采集：连续 {consecutive_bad} 帧疑似终端/全黑/尺寸不符"
+                           f"（{why}），已跳过；请保持游戏窗口在前台、不要把终端切到前面", "WARN")
+                    warned_bad = True
+                # 无效帧不更新差分基准，避免把终端/黑帧当成「页面切换」
+            else:
+                consecutive_bad = 0
+                warned_bad = False
+                changed = (prev_small is None or not only_changed or
+                           small.shape != prev_small.shape or
+                           float(np.abs(small - prev_small).mean()) >= diff_thr)
+                if changed:
+                    tag = f"mv_explore_{seq + 1:04d}"
+                    try:
+                        path = save_fn(frame, tag)
+                    except KeyboardInterrupt:
+                        raise
+                    except Exception as exc:  # noqa: BLE001
+                        log_fn(f"MV 采集：留图失败({tag})（跳过）: {exc}", "WARN")
+                        path = ""
+                    seq += 1
+                    stat["saved"] += 1
+                    if path:
+                        stat["files"].append(str(path))
+                        stat["frame_meta"].append(
+                            (str(path), float(small.mean()), float(small.std())))
+                    prev_small = small
+
+            sleep_fn(max(0.0, min(interval, max_duration - (now_fn() - started))))
+    except KeyboardInterrupt:
+        stop_reason = "ctrl_c"          # ★不吞掉后继续跑：直接跳出循环进入收尾★
+    except Exception as exc:  # noqa: BLE001 - 采集是旁路，异常不得影响登录，但须 WARN
+        stop_reason = "error"
+        log_fn(f"MV 采集循环异常（已收尾，登录结果不受影响）: {exc}", "WARN")
+    finally:
+        stat["stop_reason"] = stop_reason
+
+    log_fn("=" * 62)
+    log_fn(f"【MV 探索性实跑采集】结束（stop_reason={stop_reason}）")
+    log_fn(f"取帧 {stat['seen']} 次，留图 {stat['saved']} 张，跳过无效帧 {stat['skipped']} 张"
+           f"（疑似终端/全黑/尺寸不符 {stat['bad_frames']} 张）")
+    if stop_reason == "max_frames":
+        log_fn("★stop_reason=max_frames：留图额度耗尽，可能未走到第 5/6 步，"
+               "素材未采全，需重跑★", "WARN")
+    if stop_reason == "process_gone":
+        log_fn("游戏进程已退出，采集提前收尾（登录结果不受影响）", "WARN")
+    if stop_reason == "ctrl_c":
+        log_fn("已收到 Ctrl+C，采集优雅收尾（登录结果不受影响）")
+    if stop_reason == "error":
+        log_fn("★采集循环异常结束，素材可能不完整，需重跑★", "WARN")
+    log_fn(f"留图目录: {DEBUG_DIR / 'screencap'}")
+    if stat["files"]:
+        log_fn("本次留图清单（按序，附灰度 mean/std，便于剔除终端/桌面帧）:")
+        for p, mean, std in stat["frame_meta"]:
+            log_fn(f"    {p}  mean={mean:.1f} std={std:.1f}")
+    else:
+        log_fn("本次无留图（可能全是重复帧/无效帧，或采集被立即结束），需重跑", "WARN")
+    log_fn("=" * 62)
+    return stat
+
+
+def mv_flow_enabled(cfg: dict) -> bool:
+    """★#49★ MV 自动观看流程总开关：flow.mv_enabled 默认 false（缺 key 兼容旧配置）。"""
+    return bool(cfg.get("flow", {}).get("mv_enabled", False))
+
+
+def _mv_match(tasker, frame, tpl: str, threshold: float, roi):
+    """★#49★ MV 单模板判定（同 make_marker_hit_fn 的 post_recognition 机制）。
+
+    返回 (hit, box_center)：box_center 为截图缩放坐标 (cx, cy)（post_click 期望缩放坐标，
+    同 ClickCenterAction 的 box 中心算法）；未命中 / 异常一律 (False, None)，绝不误报。
+    """
+    from maa.pipeline import JRecognitionType, JTemplateMatch
+    try:
+        import numpy as np
+        kw = {"template": [tpl], "threshold": [float(threshold)], "method": 5}
+        if roi:
+            kw["roi"] = tuple(int(v) for v in roi)
+        arr = np.ascontiguousarray(frame)
+        job = tasker.post_recognition(JRecognitionType.TemplateMatch, JTemplateMatch(**kw), arr)
+        job.wait()
+        detail = job.get()
+        nid = detail.node_id_list[0] if (detail and getattr(detail, "node_id_list", None)) else None
+        if nid is None:
+            return False, None
+        node = tasker.get_node_detail(nid)
+        rec = getattr(node, "recognition", None)
+        if not bool(getattr(rec, "hit", False)):
+            return False, None
+        box = getattr(rec, "box", None)
+        if box is None:
+            return True, None
+        return True, (int(box.x + box.w // 2), int(box.y + box.h // 2))
+    except Exception as exc:  # noqa: BLE001 - 匹配异常按未命中
+        log(f"MV 模板 {tpl} 匹配异常（按未命中）: {exc}", "WARN")
+        return False, None
+
+
+def run_mv_flow(cfg: dict, *, ctrl, tasker, hwnd, marker_hit_fn, monitor,
+                log_fn=log, sleep_fn=time.sleep, now_fn=time.monotonic,
+                save_fn=None) -> tuple[bool, str]:
+    """★#49★ MV 自动观看流程（flow.mv_enabled=true 时由 _finish_ok 调用）。
+
+    七步语义（按 17.27~17.28 真实采集素材目视修正，比最初六步多一次返回）：
+      ①主界面点 Live → ②乐曲选择页点「观看MV」 → ③队伍确认页点「开始」
+      → ④MV 载入播放，点屏幕唤起控制条 → ⑤点顶部最右 ⏭ 退出 → Loading
+      → ⑥落回乐曲选择页，点左下 ◀ → ⑦主界面（marker 三模板正向确认）。
+
+    每步：force_foreground → 截帧 → 模板判定 → box_center 点击（coord 步先做
+    1280×720±4 几何守卫，绝不按错误坐标乱点）→ 轮询正向确认（step_timeout_sec）
+    → 超时按 step_retry 重试 → 失败留图 mv_fail_<step> 并 WARN。
+    「乐曲选择 → 主界面」最后一段零素材、是否有确认弹窗【未知】：确认超时/意外
+    弹窗一律 WARN+留图，绝不脑补点击。
+    业务失败（步骤重试耗尽 / 整体超时 / 进程退出）返回 (False, why) → FAIL_MV_FLOW；
+    不重启游戏、不改阈值、不进登录兜底。
+    sleep_fn / now_fn / save_fn / log_fn 可注入（离线单测用 fake clock 与 mock 控制器）。
+    """
+    lf = log_fn
+    if save_fn is None:
+        save_fn = lambda f, tag: save_probe_frame(f, tag, log_fn=lf)  # noqa: E731
+
+    flow_cfg = cfg.get("flow", {})
+    mvcfg = dict(flow_cfg.get("mv") or {})
+    steps = list(mvcfg.get("steps") or [])
+    overall = float(mvcfg.get("overall_timeout_sec", 240))
+    step_to = float(mvcfg.get("step_timeout_sec", 15))
+    retry = int(mvcfg.get("step_retry", 2))
+    home_to = float(mvcfg.get("return_home_confirm_sec", 20))
+    interval = 0.9
+    # ★#51★ 确认等待中的弹窗检查钩子配置（放弃中断Live确认 → 自动点「放 弃」）
+    dialog_check = bool(mvcfg.get("dialog_check", False))
+    dialogs = list(mvcfg.get("dialogs") or [])
+    dialog_click_count: dict = {}   # 同一弹窗的自动点击计数（防快速连点；超上限只 WARN 交由超时/重试）
+
+    if not steps:
+        lf("MV 流程：flow.mv.steps 为空 → 视为未配置，按失败上报", "WARN")
+        return False, "mv.steps empty"
+
+    # confirm 模板的 (threshold, roi) 从 steps 收集（confirm 通常是下一步页面的按钮）
+    tpl_params = {}
+    for s2 in steps:
+        t2 = (s2.get("template") or [None])[0]
+        if t2:
+            tpl_params[t2] = ((s2.get("threshold") or [0.75])[0],
+                              (s2.get("roi") or [None])[0])
+
+    rec = cfg.get("recognition", {})
+    lf_cfg = rec.get("loading_frame", {})
+    lt = rec.get("loading_template") or {}
+
+    def _loading(frame):
+        try:
+            hit, _ = detect_loading_frame(
+                frame, black_mean_max=lf_cfg.get("black_mean_max", 45.0),
+                white_mean_min=lf_cfg.get("white_mean_min", 220.0),
+                std_min=lf_cfg.get("std_min", 8.0),
+                white_std_max=lf_cfg.get("white_std_max", 12.0),
+                template=lt.get("file"), template_threshold=lt.get("threshold", 0.6),
+                template_roi=tuple(lt.get("roi", (860, 630, 340, 90))))
+            return hit
+        except Exception as exc:  # noqa: BLE001 - 判加载失败按非加载（不阻塞流程，交由正向确认把关）
+            lf(f"MV 流程：加载态判定异常（按非加载）: {exc}", "WARN")
+            return False
+
+    def _snap():
+        try:
+            return ctrl.post_screencap().wait().get()
+        except Exception as exc:  # noqa: BLE001
+            lf(f"MV 流程：截图失败: {exc}", "WARN")
+            return None
+
+    def _check_dialog(f2):
+        """★#51★ 确认等待中的弹窗检查钩子：命中已配置弹窗 → WARN+留图+自动点配置的按钮。
+
+        返回 True 表示检测并处理了一个弹窗（调用方继续等待原确认链自然恢复）。
+        「返回标题」类按钮绝不自动点 —— flow.mv.dialogs 配置只包含用户明确决策的点击目标
+        （#50 实测 19:22:35 弹窗：用户决策=自动点「放 弃」继续）。
+        点「放 弃」后弹窗仍在/确认仍超时 → 走既有失败路径（retry→FAIL_MV_FLOW），不无限循环。
+        """
+        if not dialog_check:
+            return False
+        for dlg in dialogs:
+            t = (dlg.get("template") or [None])[0]
+            if not t:
+                continue
+            thr = (dlg.get("threshold") or [0.75])[0]
+            roi = (dlg.get("roi") or [None])[0]
+            hit, _ = _mv_match(tasker, f2, t, thr, roi)
+            if not hit:
+                continue
+            did = str(dlg.get("id", "dialog"))
+            lf(f"检测到弹窗[{did}]（{t} 命中），按用户决策自动处理", "WARN")
+            save_fn(f2, f"mv_dialog_{did}")
+            ct = (dlg.get("click_template") or [None])[0]
+            if not ct:
+                return True
+            n = dialog_click_count.get(did, 0)
+            if n >= 3:
+                # 同一弹窗已自动点 3 次仍在 → 停止重复点击（防快速连点），交由确认超时/重试失败
+                lf(f"弹窗[{did}]：已自动点击 {n} 次仍在 → 停止重复点击，"
+                   f"交由确认超时/重试处理", "WARN")
+                return True
+            cthr = (dlg.get("click_threshold") or [0.75])[0]
+            croi = (dlg.get("click_roi") or [None])[0]
+            f3 = _snap()
+            chit, center = False, None
+            if f3 is not None and getattr(f3, "size", 0) != 0:
+                chit, center = _mv_match(tasker, f3, ct, cthr, croi)
+            if chit and center:
+                dialog_click_count[did] = n + 1
+                try:
+                    job = ctrl.post_click(int(center[0]), int(center[1]))
+                    job.wait()
+                    lf(f"弹窗[{did}]：已自动点击第 {n + 1} 次 ({center[0]},{center[1]})", "OK")
+                except Exception as exc:  # noqa: BLE001
+                    lf(f"弹窗[{did}] 点击异常: {exc}", "WARN")
+            else:
+                lf(f"弹窗[{did}]：点击按钮未命中（不脑补点击，交由确认超时/重试处理）", "WARN")
+            return True
+        return False
+
+    def _confirm(confirm, tpl, thr, roi):
+        """点击后的正向确认。返回 (ok, why)。★#51★ 每次采样先做弹窗检查钩子。"""
+        if confirm == "home":
+            end = now_fn() + home_to
+            while now_fn() < end:
+                f2 = _snap()
+                if f2 is not None and getattr(f2, "size", 0) != 0:
+                    if _check_dialog(f2):
+                        sleep_fn(interval)
+                        continue
+                    if not _loading(f2) and marker_hit_fn and marker_hit_fn(f2):
+                        save_fn(f2, "mv_return_home")
+                        return True, "home confirmed"
+                sleep_fn(interval)
+            return False, (f"home not confirmed within {home_to:.0f}s"
+                           f"（「乐曲选择→主界面」段是否有确认弹窗未知，已超时）")
+        if confirm == "gone":
+            end = now_fn() + step_to
+            while now_fn() < end:
+                f2 = _snap()
+                if f2 is None or getattr(f2, "size", 0) == 0:
+                    sleep_fn(interval)
+                    continue
+                if _check_dialog(f2):
+                    sleep_fn(interval)
+                    continue
+                hit2, _ = _mv_match(tasker, f2, tpl, thr, roi)
+                if not hit2:
+                    return True, "target gone"
+                sleep_fn(interval)
+            return False, f"{tpl} still visible after {step_to:.0f}s"
+        # confirm 为模板名（下一步页面的按钮出现 = 已进入下一步）
+        cthr, croi = tpl_params.get(confirm, (0.75, None))
+        end = now_fn() + step_to
+        while now_fn() < end:
+            f2 = _snap()
+            if f2 is not None and getattr(f2, "size", 0) != 0:
+                if _check_dialog(f2):
+                    sleep_fn(interval)
+                    continue
+                hit2, _ = _mv_match(tasker, f2, confirm, cthr, croi)
+                if hit2:
+                    return True, f"{confirm} appeared"
+            sleep_fn(interval)
+        return False, f"{confirm} not appeared within {step_to:.0f}s"
+
+    started = now_fn()
+    lf("=" * 62)
+    lf("【MV 自动观看流程】启动（mv_enabled=true；登录已成功；流程失败 → FAIL_MV_FLOW/exit 2）")
+    for i, s3 in enumerate(steps, 1):
+        lf(f"  步骤{i}: {s3.get('id')} click={s3.get('click')} "
+           f"confirm={s3.get('confirm')} tpl={(s3.get('template') or ['-'])[0]}")
+    lf(f"  overall={overall:.0f}s step_timeout={step_to:.0f}s retry={retry} "
+       f"home_confirm={home_to:.0f}s")
+    lf("=" * 62)
+
+    try:
+        for idx, st in enumerate(steps, 1):
+            sid = str(st.get("id", f"step{idx}"))
+            if now_fn() - started >= overall:
+                lf(f"MV 流程整体超时（{overall:.0f}s），中止于 {sid}", "WARN")
+                return False, f"overall_timeout@{sid}"
+            try:
+                if not monitor.alive():
+                    lf("MV 流程：游戏进程已退出，中止", "WARN")
+                    return False, f"process_gone@{sid}"
+            except Exception as exc:  # noqa: BLE001
+                lf(f"MV 流程：进程存活检查异常（按失联中止）: {exc}", "WARN")
+                return False, f"process_check_error@{sid}"
+
+            click_kind = str(st.get("click", "box_center"))
+            tpl = (st.get("template") or [None])[0]
+            thr = (st.get("threshold") or [0.75])[0]
+            roi = (st.get("roi") or [None])[0]
+            confirm = str(st.get("confirm", ""))
+            coord = st.get("coord")
+            post_wait = float(st.get("post_wait_sec", 0.0))
+
+            attempt = 0
+            ok_step, why = False, ""
+            while attempt <= retry:
+                # ★#49★ 重试期间同样受整体预算约束（截图失败等内层 continue 不绕过 overall）
+                if now_fn() - started >= overall:
+                    lf(f"MV 流程整体超时（{overall:.0f}s），中止于 {sid}（重试期间）", "WARN")
+                    return False, f"overall_timeout@{sid}"
+                attempt += 1
+                if attempt > 1:
+                    lf(f"MV 步骤 {sid} 第 {attempt}/{retry + 1} 次尝试", "WARN")
+                try:
+                    force_foreground(hwnd)
+                except Exception as exc:  # noqa: BLE001
+                    lf(f"MV 步骤 {sid} 置前失败（继续）: {exc}", "WARN")
+                frame = _snap()
+                if frame is None or getattr(frame, "size", 0) == 0:
+                    lf(f"MV 步骤 {sid} 截图无效，稍后重试", "WARN")
+                    ok_step, why = False, "screencap invalid"
+                    sleep_fn(0.8)
+                    continue
+
+                if click_kind == "coord":
+                    import numpy as np
+                    arr = np.asarray(frame)
+                    h, w = int(arr.shape[0]), int(arr.shape[1])
+                    if abs(w - 1280) > 4 or abs(h - 720) > 4:
+                        lf(f"MV 步骤 {sid} 几何不符 {w}x{h}（应 1280×720±4），"
+                           f"跳过坐标点击，绝不按错误坐标乱点", "WARN")
+                        ok_step, why = False, f"geometry {w}x{h}"
+                        sleep_fn(interval)
+                        continue
+                    cx, cy = int(coord[0]), int(coord[1])
+                else:
+                    hit, center = _mv_match(tasker, frame, tpl, thr, roi)
+                    if not hit or center is None:
+                        lf(f"MV 步骤 {sid}：{tpl} 未命中（等待/重试）")
+                        ok_step, why = False, f"{tpl} not found"
+                        sleep_fn(interval)
+                        continue
+                    cx, cy = center
+
+                try:
+                    job = ctrl.post_click(int(cx), int(cy))
+                    job.wait()
+                except Exception as exc:  # noqa: BLE001
+                    lf(f"MV 步骤 {sid} 点击异常: {exc}", "WARN")
+                    ok_step, why = False, f"click error: {exc}"
+                    sleep_fn(interval)
+                    continue
+                lf(f"MV 步骤 {sid}：点击 ({cx},{cy})（{click_kind}）")
+
+                ok_step, why = _confirm(confirm, tpl, thr, roi)
+                if ok_step:
+                    if post_wait > 0:
+                        lf(f"MV 步骤 {sid}：确认成功，等待 {post_wait:.1f}s（MV 载入/过渡）")
+                        sleep_fn(post_wait)
+                    break
+                save_fn(frame, f"mv_fail_{sid}")
+                lf(f"MV 步骤 {sid} 确认失败: {why}（已留图 mv_fail_{sid}）", "WARN")
+                sleep_fn(interval)
+
+            if not ok_step:
+                lf(f"MV 步骤 {sid} 重试耗尽（{retry + 1} 次），MV 流程失败", "WARN")
+                return False, f"{sid}: {why}"
+            lf(f"MV 步骤 {sid} ✔ {why}")
+
+        lf("【MV 自动观看流程】全部步骤完成，已回到主界面", "OK")
+        return True, "all steps done"
+    except Exception as exc:  # noqa: BLE001 - 意外异常：留图+WARN 后向上抛，由 _finish_ok 吞掉
+        try:
+            frame = _snap()
+            if frame is not None and getattr(frame, "size", 0) != 0:
+                save_fn(frame, "mv_fail_exception")
+        except Exception:  # noqa: BLE001
+            pass
+        lf(f"MV 流程异常（已留图 mv_fail_exception，向上抛出由收口逻辑吞掉）: "
+           f"{type(exc).__name__}: {exc}", "WARN")
+        raise
+
+
 def run(cfg: dict, skip_launch: bool = False) -> tuple[bool, str]:
     init_framework_logging()
     # ★#14★ 本进程设为 Per-Monitor DPI aware，保证窗口预调整/读取用物理像素（175% 缩放下必需）。
@@ -1484,6 +1999,70 @@ def run(cfg: dict, skip_launch: bool = False) -> tuple[bool, str]:
         # 供本轮「直判」与 post_click_verify 三态判定共用，避免重复构造。
         marker_hit_fn = make_marker_hit_fn(tasker, cfg)  # 内部 build_marker_params 已做空/缺文件硬守护
 
+        def _finish_ok(when: str) -> tuple[bool, str]:
+            """★#39★ 登录已确认成功后的统一收口：默认关闭时逐字零回归。
+
+            本闭包与 run() 共享同一会话对象（ctrl / tasker / hwnd / marker_hit_fn /
+            monitor / cfg）；采集模式「只读旁观」，不使用 marker_hit_fn 改判定、
+            不抢窗口焦点、不点击、不发任务、不做识别。
+            - mv_explore=false（默认）：直接 return True, OK_MARKER —— 不截图、不留图、
+              不写任何日志、不改变时序，与 #33 基线行为逐字一致。
+            - mv_explore=true：旁路跑 mv_explore_loop()，结束后仍 return True, OK_MARKER
+              / 退出码 0（登录本就成功，采集是旁路，不新增结果码、不动三态、不改文案）。
+              ★#49★ 采集是「用户手动走」模式，与脚本自动点击互斥：此时跳过 MV 自动流程并 WARN。
+            - ★#49★ mv_enabled=true（且未开采集）：跑 run_mv_flow() 自动观看；业务失败
+              → return False, FAIL_MV_FLOW（#34 §5.3 选项 B → report_result else → exit 2）；
+              意外异常一律吞掉+WARN，仍 return True, OK_MARKER（不把登录成功降级）。
+            """
+            global _LAST_MV_STAT          # ★#48★ 采集统计透传给结果文件
+            # ★#49★ 双开关都关（默认）→ 直接返回，不截图/不留图/不写日志/不改变时序（逐字零回归）
+            if not mv_explore_enabled(cfg) and not mv_flow_enabled(cfg):
+                return True, OK_MARKER
+            if not mv_explore_enabled(cfg):
+                # ★#49★ mv_enabled=true：MV 自动观看流程（登录已成功；业务失败按选项 B 上报）
+                try:
+                    ok_mv, why_mv = run_mv_flow(
+                        cfg, ctrl=ctrl, tasker=tasker, hwnd=hwnd,
+                        marker_hit_fn=marker_hit_fn, monitor=monitor)
+                except Exception as exc:  # noqa: BLE001 - 意外异常吞掉，不把登录成功降级
+                    log(f"MV 流程异常（已忽略，登录结果不变）: {type(exc).__name__}: {exc}", "WARN")
+                    return True, OK_MARKER
+                if ok_mv:
+                    log("MV 自动观看流程完成（登录结果不变）", "OK")
+                    return True, OK_MARKER
+                log(f"MV 自动观看流程失败: {why_mv}（登录已成功；按 #34 §5.3 选项 B 上报 "
+                    f"FAIL_MV_FLOW → exit 2）", "WARN")
+                return False, FAIL_MV_FLOW
+            try:
+                log(f"MV 探索采集：登录已确认（入口[{when}]），开始旁路只读采集"
+                    f"（登录结果不变）")
+                stat = mv_explore_loop(
+                    cfg,
+                    screencap_fn=lambda: ctrl.post_screencap().wait().get(),
+                    is_alive_fn=monitor.alive,
+                    save_fn=lambda f, tag: save_probe_frame(f, tag, log_fn=log),
+                    log_fn=log,
+                )
+                _LAST_MV_STAT = stat       # ★#48★ 供 write_result_files 读取采集统计
+                # ★#46 P2-1★ 采集自身异常/空采集必须显式 WARN，避免「看起来采到了其实没有」
+                stop = (stat or {}).get("stop_reason", "unknown")
+                if not (stat or {}).get("enabled", False) or stop == "error":
+                    log(f"★MV 探索采集未正常执行（stop_reason={stop}），素材未采到，需重跑★"
+                        f"（登录结果不变）", "WARN")
+                elif (stat or {}).get("saved", 0) == 0:
+                    log("★MV 探索采集本次 0 张留图，素材未采到，需重跑★（登录结果不变）", "WARN")
+            except KeyboardInterrupt:
+                log("MV 探索采集被 Ctrl+C 中断（登录结果不变）", "WARN")
+            except Exception as exc:  # noqa: BLE001 - 附加采集异常绝不影响「登录已成功」
+                import traceback
+                log(f"★MV 探索采集未正常执行（异常），素材未采到，需重跑★: "
+                    f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
+                    f"（登录结果不变）", "WARN")
+            if mv_flow_enabled(cfg):
+                log("mv_enabled 与 mv_explore 同时开启：采集（用户手动）优先，"
+                    "本次跳过 MV 自动观看流程", "WARN")
+            return True, OK_MARKER
+
         def _direct_confirm(when: str) -> bool:
             """对当前帧直判一次主界面，绕开 sink.is_success 的 TitleScreenDetectedClick 门槛。
 
@@ -1505,7 +2084,7 @@ def run(cfg: dict, skip_launch: bool = False) -> tuple[bool, str]:
 
         # ① 每轮 pipeline 之前（含 SESSION_LOST / 进程退出重连后的新一轮开头）：直达主界面立刻确认
         if _direct_confirm("pipeline 前"):
-            return True, OK_MARKER
+            return _finish_ok("pipeline 前直判")
 
         # ★#18★ 每次跑 pipeline 前强制置前（上次会话 SetForegroundWindow 一直被拒）
         try:
@@ -1583,7 +2162,7 @@ def run(cfg: dict, skip_launch: bool = False) -> tuple[bool, str]:
         # 的主界面帧。重连后直达主界面时 TitleScreenDetectedClick 不命中、is_success=False，
         # 若没有这里，post_click_verify 永不调用、OK_MARKER 永久不可达（老毛病「进了游戏却判失败」）。
         if _direct_confirm("门控前"):
-            return True, OK_MARKER
+            return _finish_ok("门控前直判")
 
         # 前置：pipeline 走到成功标志节点 + 进程存活（★#23★ 不再是 OK_MARKER 的唯一入口）
         if not (sink.is_success(tasker) and monitor.alive()):
@@ -1622,7 +2201,7 @@ def run(cfg: dict, skip_launch: bool = False) -> tuple[bool, str]:
 
         if verdict == "MARKER":
             log(f"成功【{OK_MARKER}】：{why}（正向主界面模板命中，已确认进入游戏）", "OK")
-            return True, OK_MARKER
+            return _finish_ok("post_click_verify MARKER")
 
         if verdict == "LEFT_TITLE":
             # 疑似成功：按钮连续 20s 不见 + 非加载态 + 进程存活，但**没有**正向标志 →
@@ -2715,6 +3294,345 @@ def static_self_check(cfg: dict) -> bool:
     except Exception as exc:
         failures.append(f"#23 完整 override 注入检查失败: {exc}")
 
+    # 26) ★#39★ MV 探索性实跑采集模式：默认关闭零回归 + 旁路只读 + 既有红线完好
+    try:
+        src26 = (BASE_DIR / "main.py").read_text(encoding="utf-8")
+        run_body26 = src26[src26.index("def run(cfg: dict"):src26.index("def static_self_check")]
+        finish_body = src26[src26.index("def _finish_ok("):src26.index("def _direct_confirm(")]
+        # ★#49 适配★ 采集循环切片原到 def run；现 mv_flow_enabled/_mv_match/run_mv_flow 插入其间，
+        # 收窄到 mv_explore_loop 自身函数体 —— 只读旁观断言的意图不变（MV 流程合法使用置前/点击）。
+        loop_body = src26[src26.index("def mv_explore_loop("):src26.index("def mv_flow_enabled(")]
+
+        # (a) 默认关闭（含缺 key 兼容），配置齐全且取值合理
+        assert mv_explore_enabled(cfg) is False, "#39 mv_explore 必须默认 false"
+        assert mv_explore_enabled({"flow": {}}) is False, "#39 缺 key 必须按 false 处理"
+        ec26 = cfg["flow"]["mv_explore_cfg"]
+        assert 0.8 <= float(ec26["sample_interval_sec"]) <= 1.0, "采样间隔须在 0.8~1.0s"
+        assert float(ec26["max_duration_sec"]) > 0 and int(ec26["max_frames"]) > 0, \
+            "时长/留图数上限须为正"
+        assert bool(ec26["only_changed_frames"]) is True, "须开启『变化帧才留』"
+
+        # (b) 三处 OK_MARKER return 全部经 _finish_ok；双关闭分支在截图/日志之前直接返回
+        #     ★#49 适配★ _finish_ok 现分流 mv_explore（采集）与 mv_enabled（自动观看），
+        #     双关闭合并分支保持「截图前直接 return True, OK_MARKER」的零回归语义；
+        #     断言锚点同步适配、意图不变，MV 分支断言在 [28] 补强。
+        assert run_body26.count("return _finish_ok(") == 3, \
+            "#39 三处 OK_MARKER 返回必须全部改为 return _finish_ok(...)（漏一处直判会跳过采集）"
+        assert "\n                return True, OK_MARKER" in finish_body, \
+            "#39/#49 双关闭分支须直接 return True, OK_MARKER（16 空格）"
+        idx_both26 = finish_body.index(
+            "if not mv_explore_enabled(cfg) and not mv_flow_enabled(cfg):")
+        idx_default26 = finish_body.index("return True, OK_MARKER", idx_both26)
+        idx_log26 = finish_body.index("log(", idx_both26)
+        idx_cap26 = finish_body.index("screencap_fn=")
+        assert idx_both26 < idx_default26 < idx_log26 < idx_cap26, \
+            "#39/#49 双关闭分支必须在任何日志与截图之前直接返回（零截图/零留图/零日志/零时序变化）"
+
+        # (c) 开启时的循环必须有：帧差去重、时长/留图数上限、Ctrl+C 收尾、进程消失收尾、
+        #     无效帧跳过；且绝不抢焦点/点击/发任务/识别/停任务（只读旁观）
+        for key26, desc26 in [
+            ("frame_diff_threshold", "帧差去重阈值"),
+            ("max_duration", "总时长上限"),
+            ("max_frames", "最大留图数"),
+            ("KeyboardInterrupt", "Ctrl+C 优雅收尾"),
+            ("process_gone", "进程消失收尾"),
+            ("only_changed", "变化帧才留"),
+            ("_mv_frame_signature", "无效帧（终端/全黑/尺寸不符）跳过"),
+        ]:
+            assert key26 in loop_body, f"#39 观察循环缺少 {desc26}（{key26}）"
+        assert "force_foreground" not in loop_body, \
+            "#39 观察循环内不得反复抢窗口焦点（会抢用户焦点、干扰手动点击）"
+        assert all(k not in loop_body for k in
+                   ("post_click", "post_task", "post_recognition", "post_stop")), \
+            "#39 采集只读旁观，绝不点击/发任务/识别/停止"
+
+        # (d) 行为：关闭时 mv_explore_loop 零截图/零留图/零日志（mock 注入）
+        calls26 = {"cap": 0, "save": 0, "log": 0, "alive": 0}
+
+        def cap26():
+            calls26["cap"] += 1
+            return None
+
+        def save26(f, tag):
+            calls26["save"] += 1
+            return ""
+
+        def log26(*a, **k):
+            calls26["log"] += 1
+
+        def alive26():
+            calls26["alive"] += 1
+            return True
+
+        st26 = mv_explore_loop(cfg, screencap_fn=cap26, is_alive_fn=alive26,
+                               save_fn=save26, log_fn=log26,
+                               sleep_fn=lambda s: None, now_fn=lambda: 0.0)
+        assert st26["enabled"] is False and st26["stop_reason"] == "disabled", \
+            "#39 关闭时 mv_explore_loop 须立即返回 disabled"
+        assert all(v == 0 for v in calls26.values()), \
+            f"#39 关闭时不得截图/留图/写日志/查进程（实际 {calls26}）"
+
+        # (e) 行为：开启时最小驱动（fake clock 立即到时长上限）验证入口可用、无异常
+        c26 = json.loads(json.dumps(cfg))
+        c26["flow"]["mv_explore"] = True
+        c26["flow"]["mv_explore_cfg"]["max_duration_sec"] = 0
+        st26b = mv_explore_loop(c26, screencap_fn=cap26, is_alive_fn=alive26,
+                                save_fn=save26, log_fn=log26,
+                                sleep_fn=lambda s: None, now_fn=lambda: 0.0)
+        assert st26b["enabled"] is True and st26b["stop_reason"] == "max_duration", \
+            "#39 开启时循环须能正常进入并按时长上限收尾"
+
+        # (f) 既有红线完好：三态 / in_game_marker 三数组 / <0.55 守护 / inverse=True / login.json
+        nop26 = lambda *a, **k: None  # noqa: E731
+        assert report_result(OK_MARKER, log_fn=nop26) == 0
+        assert report_result(OK_DEGRADED_UNVERIFIED, log_fn=nop26) == 3
+        assert report_result(FAIL_NOT_CONFIRMED, log_fn=nop26) == 2
+        rec26 = cfg["recognition"]
+        assert len(rec26["in_game_marker_template"]) == \
+               len(rec26["in_game_marker_threshold"]) == \
+               len(rec26["in_game_marker_roi"]) == 3, "#39 不得改动 in_game_marker 三数组"
+        assert rec26["in_game_marker_threshold"] == [0.55, 0.75, 0.6], \
+            "#39 严禁改动阈值数值"
+        low26 = json.loads(json.dumps(cfg))
+        low26["recognition"]["in_game_marker_threshold"] = [0.1, 0.1, 0.1]
+        assert build_marker_params(low26) is None, "#39 <0.55 阈值下限守护须完好"
+        assert build_pipeline_override(cfg)["InGameSuccess"]["inverse"] is True, \
+            "#39 InGameSuccess 必须维持 inverse=True"
+        login26 = json.loads((PIPELINE_DIR / "login.json").read_text(encoding="utf-8"))
+        assert len(login26) == 10, "#39 login.json 须仍为 10 节点（本次不得改动）"
+        assert "InGameSuccess" in login26 and "WaitInGame" in login26
+
+        # (g) ★#46★ P1-1 max_frames 防回退 + P1-2 --mv-explore 命令行开关
+        assert int(ec26["max_frames"]) >= 200, \
+            "#46 P1-1 max_frames 须 >=200（60 会在 54~107s 提前截断、采不到第 5/6 步）"
+        # 用「换行 + 完整签名」定位真实定义，避免误命中 [22] 里 src.index("def main(argv=None)") 的字符串字面量
+        main_body26 = src26[src26.index("\ndef main(argv=None) -> int:") + 1:]
+        assert 'add_argument("--mv-explore"' in main_body26, "#46 须有 --mv-explore 命令行开关"
+        assert "args.mv_explore" in main_body26 and \
+               'cfg["flow"]["mv_explore"] = True' in main_body26, \
+            "#46 开关须做内存覆盖（仅 run 路径，不写盘）"
+        assert not any(k in main_body26 for k in
+                       ("write_text", "json.dump", "CONFIG_FILE", "open(")), \
+            "#46 --mv-explore 仅内存覆盖，绝不写盘"
+        disk_cfg26 = load_settings()
+        assert disk_cfg26["flow"]["mv_explore"] is False, \
+            "#46 落盘默认必须仍为 false（开关不落盘）"
+        assert mv_explore_enabled(cfg) is False, \
+            "#46 不带开关时 mv_explore 仍为 false"
+        print("[26] ★#39/#46 MV 探索采集模式 OK★: 默认关闭(mv_explore=false)、三处 OK_MARKER "
+              "return 全经 _finish_ok、关闭零截图/零留图/零日志/零时序；开启循环含帧差去重/"
+              "时长+留图数上限/Ctrl+C+进程消失收尾/无效帧跳过、不抢焦点也无任何点击；"
+              "★#46: max_frames>=200、--mv-explore 开关存在/仅内存覆盖不落盘/不带开关仍 false★；"
+              "三态 0/3/2、in_game_marker 三数组与 [0.55,0.75,0.6]、<0.55 守护、"
+              "InGameSuccess inverse=True、login.json 10 节点均完好")
+    except Exception as exc:
+        failures.append(f"#39 MV 探索采集检查失败: {exc}")
+
+    # 27) ★#48★ 实跑结果结构化输出：真调用 write_result_files 验证内容（非纯源码匹配）
+    try:
+        import tempfile
+        tmp27 = Path(tempfile.mkdtemp(prefix="result_json_"))
+
+        # (a) 关闭采集：mode=login、必含字段、不含采集字段、login_ok=True
+        c27 = json.loads(json.dumps(cfg))
+        c27["flow"]["mv_explore"] = False
+        r27a = write_result_files(c27, ok=True, reason=OK_MARKER, exit_code=0,
+                                  duration_sec=1.25, out_dir=tmp27, mv_stat=None)
+        for k27 in ("schema_version", "timestamp", "duration_sec", "exit_code",
+                    "verdict", "terminal_text", "mode", "login_ok",
+                    "config_snapshot", "key_log_lines"):
+            assert k27 in r27a, f"#48 last_result 缺字段 {k27}"
+        assert r27a["mode"] == "login" and r27a["exit_code"] == 0 \
+               and r27a["verdict"] == OK_MARKER and r27a["login_ok"] is True
+        assert all(k27 not in r27a for k27 in
+                   ("stop_reason", "frames_saved", "probe_files", "collection_warn")), \
+            "#48 关闭采集时不得含采集字段"
+        assert r27a["config_snapshot"]["in_game_marker_threshold"] == [0.55, 0.75, 0.6]
+        p27 = tmp27 / "last_result.json"
+        assert p27.is_file() and json.loads(p27.read_text(encoding="utf-8"))["mode"] == "login", \
+            "#48 落盘的 last_result.json 内容须与返回值一致"
+
+        # (b) 采集模式：stop_reason / 统计 / probe_files / collection_warn；login_ok 分离
+        stat27 = {
+            "enabled": True, "seen": 17, "saved": 10, "skipped": 1, "bad_frames": 1,
+            "stop_reason": "max_frames",
+            "files": ["/x/in_game_probe_x_mv_explore_0001.png"],
+            "frame_meta": [("/x/in_game_probe_x_mv_explore_0001.png", 120.0, 30.0)],
+        }
+        c27b = json.loads(json.dumps(cfg))
+        c27b["flow"]["mv_explore"] = True
+        r27b = write_result_files(c27b, ok=True, reason=OK_MARKER, exit_code=0,
+                                  duration_sec=2.0, out_dir=tmp27, mv_stat=stat27)
+        assert r27b["mode"] == "mv_explore" and r27b["stop_reason"] == "max_frames"
+        assert r27b["frames_taken"] == 17 and r27b["frames_saved"] == 10 \
+               and r27b["frames_skipped_invalid"] == 1
+        assert r27b["probe_files"] and r27b["probe_files"][0]["mean"] == 120.0
+        assert "需重跑" in r27b["collection_warn"]
+        assert r27b["login_ok"] is True, "#48 登录成功与采集完整性必须分离"
+
+        # (c) last_result.json 覆盖写；results.jsonl 只追加（2 行）
+        disk27 = json.loads(p27.read_text(encoding="utf-8"))
+        assert disk27["mode"] == "mv_explore" and disk27["stop_reason"] == "max_frames", \
+            "#48 last_result.json 必须覆盖为最新一次"
+        lines27 = (tmp27 / "results.jsonl").read_text(encoding="utf-8").strip().splitlines()
+        assert len(lines27) == 2, f"#48 results.jsonl 须逐次追加 2 行，实际 {len(lines27)}"
+        assert json.loads(lines27[0])["mode"] == "login"
+        assert json.loads(lines27[1])["mode"] == "mv_explore"
+
+        # (d) 崩溃兜底：run.bat 内存在（真调用写出验证在 35-verify.py）
+        bat27 = (BASE_DIR / "run.bat").read_text(encoding="utf-8")
+        assert "interpreter_crash" in bat27 and "CRASH48" in bat27, \
+            "#48 run.bat 须含崩溃兜底"
+
+        # (e) ★#51★ login_ok 与 MV 流程分离：run() 返回 (False, FAIL_MV_FLOW) 时
+        #     login_ok 必须仍为 True（登录本身已 OK_MARKER 成功，不被 MV 附加流程覆盖）
+        nop27 = lambda *a, **k: None  # noqa: E731
+        assert report_result(FAIL_MV_FLOW, log_fn=nop27) == 2
+        r27e = write_result_files(cfg, ok=False, reason=FAIL_MV_FLOW, exit_code=2,
+                                  duration_sec=1.0, out_dir=tmp27, mv_stat=None)
+        assert r27e["verdict"] == FAIL_MV_FLOW and r27e["login_ok"] is True, \
+            "#51 login_ok 须与 MV 流程结果分离（登录已成功的事实不被 FAIL_MV_FLOW 覆盖）"
+        assert r27e["exit_code"] == 2, "#51 FAIL_MV_FLOW 场景 exit_code 仍须为 2"
+        print("[27] ★#48/#51 结果文件 OK★: 真调用 write_result_files —— 关闭采集 mode=login"
+              "（不含采集字段）/ 采集含 stop_reason+统计+probe_files+collection_warn /"
+              "login_ok 与采集完整性分离 / last_result.json 覆盖写 / results.jsonl 只追加 /"
+              "run.bat 崩溃兜底存在 / ★#51: FAIL_MV_FLOW 时 login_ok 仍为 True★")
+    except Exception as exc:
+        failures.append(f"#48 结果文件检查失败: {exc}")
+
+    # 28) ★#49★ MV 自动观看流程：配置/模板/默认关闭/confirm 链/接入/三态不受影响/失败路径真调用
+    try:
+        src28 = (BASE_DIR / "main.py").read_text(encoding="utf-8")
+        # (a) 默认关闭 + 缺 key 兼容 + 配置结构
+        assert mv_flow_enabled(cfg) is False, "#49 mv_enabled 必须默认 false"
+        assert mv_flow_enabled({"flow": {}}) is False, "#49 缺 key 必须按 false 处理"
+        main_body49 = src28[src28.index("\ndef main(argv=None) -> int:") + 1:]
+        assert 'add_argument("--mv-enabled"' in main_body49 \
+               and "args.mv_enabled" in main_body49 \
+               and 'cfg["flow"]["mv_enabled"] = True' in main_body49, \
+            "#49 --mv-enabled 开关须存在并做内存覆盖"
+        assert not any(k in main_body49 for k in
+                       ("write_text", "json.dump", "CONFIG_FILE", "open(")), \
+            "#49 --mv-enabled 仅内存覆盖，绝不写盘"
+        mvcfg28 = cfg["flow"]["mv"]
+        steps28 = mvcfg28["steps"]
+        assert [s28["id"] for s28 in steps28] == [
+            "1_click_live", "2_click_watch", "3_click_start",
+            "4_tap_screen", "5_click_ff", "6_click_back"], "#49 步骤 id 须按七步语义完整"
+        assert float(mvcfg28["overall_timeout_sec"]) > 0 \
+               and float(mvcfg28["step_timeout_sec"]) > 0 \
+               and int(mvcfg28["step_retry"]) >= 0 \
+               and float(mvcfg28["return_home_confirm_sec"]) > 0, "#49 超时/重试参数须有效"
+
+        # (b) 模板文件存在 + 尺寸 + 阈值下限 + confirm 链
+        for t28, (w28, h28) in {"mv_watch_button.png": (195, 53),
+                                "mv_start_button.png": (195, 53),
+                                "mv_ff_button.png": (62, 62),
+                                "mv_back_button.png": (52, 52)}.items():
+            p28 = IMAGE_DIR / t28
+            assert p28.is_file(), f"#49 模板缺失: {t28}"
+            with open(p28, "rb") as fh28:
+                head28 = fh28.read(33)
+            assert struct.unpack(">II", head28[16:24]) == (w28, h28), \
+                f"#49 模板 {t28} 尺寸须为 {w28}x{h28}"
+        for s28 in steps28:
+            for th28 in (s28.get("threshold") or []):
+                assert float(th28) >= 0.55, f"#49 MV 阈值严禁 <0.55（{s28['id']}={th28}）"
+            for r28 in (s28.get("roi") or []):
+                assert len(r28) == 4, f"#49 roi 须为 [x,y,w,h]（{s28['id']}）"
+
+        # (b2) ★#51★ 弹窗检查配置与模板（放弃中断Live确认 → 自动点「放 弃」）
+        assert bool(mvcfg28.get("dialog_check")) is True, "#51 dialog_check 须默认开启"
+        dlgs28 = mvcfg28.get("dialogs") or []
+        assert dlgs28 and dlgs28[0].get("id") == "discard_live", \
+            "#51 弹窗配置须存在（discard_live）"
+        for t51, (w51, h51) in {"mv_dialog_discard.png": (208, 62),
+                                "mv_dialog_title.png": (793, 38)}.items():
+            p51 = IMAGE_DIR / t51
+            assert p51.is_file(), f"#51 模板缺失: {t51}"
+            with open(p51, "rb") as fh51:
+                head51 = fh51.read(33)
+            assert struct.unpack(">II", head51[16:24]) == (w51, h51), \
+                f"#51 模板 {t51} 尺寸须为 {w51}x{h51}"
+        d51 = dlgs28[0]
+        assert d51["template"][0] == "mv_dialog_title.png" \
+               and d51["click_template"][0] == "mv_dialog_discard.png", \
+            "#51 弹窗须用标题条识别、点击目标=「放 弃」按钮（返回标题绝不自动点）"
+        assert float(d51["threshold"][0]) >= 0.55 \
+               and float(d51["click_threshold"][0]) >= 0.55, "#51 弹窗阈值严禁 <0.55"
+        assert steps28[0]["template"][0] == "home_nav_bottom_right.png" \
+               and float(steps28[0]["threshold"][0]) == 0.55, \
+            "#49 第 1 步须复用主界面 Live 区域模板与阈值"
+        assert steps28[3]["click"] == "coord" and steps28[3]["coord"] == [640, 360], \
+            "#49 第 4 步须为屏幕中心坐标点击"
+        assert [s28.get("confirm") for s28 in steps28] == [
+            "mv_watch_button.png", "mv_start_button.png", "gone",
+            "mv_ff_button.png", "mv_watch_button.png", "home"], "#49 confirm 链须完整"
+
+        # (c) _finish_ok 接入 + run_mv_flow 关键结构（源码断言）
+        body28 = src28[src28.index("def _finish_ok("):src28.index("def _direct_confirm(")]
+        assert "run_mv_flow(" in body28 and "FAIL_MV_FLOW" in body28 \
+               and "mv_flow_enabled(cfg)" in body28, "#49 _finish_ok 须接入 MV 自动观看分支"
+        assert "mv_enabled 与 mv_explore 同时开启" in body28, "#49 双开互斥须 WARN"
+        loop28 = src28[src28.index("def run_mv_flow("):src28.index("def run(cfg: dict")]
+        assert "force_foreground(hwnd)" in loop28 and "post_click" in loop28, \
+            "#49 每步须置前后点击"
+        assert "mv_fail_" in loop28 and "mv_return_home" in loop28, \
+            "#49 失败/回主页留图 tag 须存在"
+        assert "1280" in loop28 and "720" in loop28, "#49 coord 步须 1280×720±4 几何守卫"
+        assert "未知" in loop28, "#49 未知弹窗段须按『未知』处理（绝不脑补点击）"
+        assert "_check_dialog" in loop28 and "mv_dialog_" in loop28 \
+               and "dialog_check" in loop28, \
+            "#51 确认等待中的弹窗检查钩子（_check_dialog）须存在且接入"
+
+        # (d) 三态语义不受影响：FAIL_MV_FLOW 走 else → exit 2；0/3/2 不变
+        nop28 = lambda *a, **k: None  # noqa: E731
+        assert report_result(FAIL_MV_FLOW, log_fn=nop28) == 2, "#49 FAIL_MV_FLOW 须 exit 2"
+        assert report_result(OK_MARKER, log_fn=nop28) == 0 \
+               and report_result(OK_DEGRADED_UNVERIFIED, log_fn=nop28) == 3 \
+               and report_result(FAIL_NOT_CONFIRMED, log_fn=nop28) == 2, "#49 三态 0/3/2 不受影响"
+
+        # (e) 行为：真实 run_mv_flow + mock 控制器（模板全不命中）→ 重试耗尽安全返回 (False, why)
+        class _Job28:
+            def __init__(self, v):
+                self._v = v
+
+            def wait(self):
+                return self
+
+            def get(self):
+                return self._v
+
+        class _Ctrl28:
+            def post_screencap(self):
+                import numpy as np
+                return _Job28(np.zeros((720, 1280, 3), np.uint8))
+
+            def post_click(self, x, y):
+                return _Job28(True)
+
+        class _Mon28:
+            def alive(self):
+                return True
+
+        st28 = run_mv_flow(cfg, ctrl=_Ctrl28(), tasker=None, hwnd=None,
+                           marker_hit_fn=None, monitor=_Mon28(),
+                           sleep_fn=lambda s: None, now_fn=lambda: 0.0,
+                           save_fn=lambda f, tag: "")
+        assert st28[0] is False and "1_click_live" in st28[1], \
+            f"#49 失败路径须安全返回 (False, why)，实际 {st28}"
+
+        print("[28] ★#49/#51 MV 自动观看流程 OK★: mv_enabled 默认 false、七步 id/confirm 链完整、"
+              "4 张模板存在且尺寸正确、阈值全部 ≥0.55、第 1 步复用 home_nav_bottom_right(0.55)、"
+              "第 4 步 coord=[640,360]；_finish_ok 接入 MV 分支（失败→FAIL_MV_FLOW、异常吞掉、"
+              "双开互斥 WARN）；每步置前+box_center 点击+几何守卫+失败留图 mv_fail_*+"
+              "回主页 mv_return_home；FAIL_MV_FLOW→exit 2 且三态 0/3/2 不变；"
+              "mock 控制器失败路径真调用安全返回；"
+              "★#51: dialog_check=true、弹窗标题/放弃按钮模板存在且阈值≥0.55、"
+              "_check_dialog 钩子接入确认循环★")
+    except Exception as exc:
+        failures.append(f"#49 MV 自动观看流程检查失败: {exc}")
+
     print("-" * 70)
     if failures:
         for f in failures:
@@ -2756,18 +3674,122 @@ def report_result(reason: str, *, log_fn=None) -> int:
     return 2
 
 
+# --------------------------------------------------------------------------- #
+# ★#48★ 实跑结果结构化输出：last_result.json（覆盖写）+ results.jsonl（只追加）
+#   纯旁路：在 main() 拿到 report_result 的退出码后、进程退出前写出；任何写文件异常
+#   由 main() 吞掉并 WARN，绝不影响退出码与三态文案（零回归）。
+#   _LAST_MV_STAT 由 run() 内的 _finish_ok 闭包在采集结束时赋值（模块级，仅新增代码使用）；
+#   out_dir 可注入，供 --check [27] / 35-verify.py 用临时目录离线验证，不污染真实 debug/。
+# --------------------------------------------------------------------------- #
+_LAST_MV_STAT: dict | None = None
+
+
+def _terminal_text_from_ring() -> str:
+    """从日志环形缓存取最后一条『结果: …』原文（report_result 打印的终局文案）。"""
+    for line in reversed(_LOG_RING):
+        if "结果: " in line:
+            return line[line.index("结果: "):]
+    return ""
+
+
+def write_result_files(cfg: dict, *, ok: bool, reason: str, exit_code: int,
+                       duration_sec: float, out_dir=None, mv_stat=None) -> dict:
+    """★#48★ 写 last_result.json（覆盖）与 results.jsonl（追加），返回写入的完整 dict。
+
+    out_dir / mv_stat 可注入（供 --check [27] 与 35-verify.py 离线验证，不污染真实 debug/）；
+    main() 实跑时不传，mv_stat 自动取模块级 _LAST_MV_STAT。
+    """
+    out = Path(out_dir) if out_dir else DEBUG_DIR
+    out.mkdir(parents=True, exist_ok=True)
+
+    flow = cfg.get("flow", {})
+    rec = cfg.get("recognition", {})
+    ecfg = flow.get("mv_explore_cfg", {}) or {}
+    mode = "mv_explore" if mv_explore_enabled(cfg) else "login"
+    stat = dict(mv_stat if mv_stat is not None else (_LAST_MV_STAT or {}))
+
+    result = {
+        "schema_version": 1,
+        "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+        "duration_sec": round(float(duration_sec), 3),
+        "exit_code": int(exit_code),
+        "verdict": reason,
+        "terminal_text": _terminal_text_from_ring(),
+        "mode": mode,
+        # ★#51★ FAIL_MV_FLOW 时 run() 返回 (False, FAIL_MV_FLOW)，但登录本身已 OK_MARKER 成功
+        #（19:22:19 实测）—— login_ok 表达「登录是否成功」，不得被 MV 附加流程结果覆盖。
+        "login_ok": bool(ok) or reason == FAIL_MV_FLOW,
+        "config_snapshot": {
+            "mv_explore": bool(flow.get("mv_explore", False)),
+            "max_frames": ecfg.get("max_frames"),
+            "max_duration_sec": ecfg.get("max_duration_sec"),
+            "sample_interval_sec": ecfg.get("sample_interval_sec"),
+            "in_game_marker_threshold": rec.get("in_game_marker_threshold"),
+        },
+        "key_log_lines": list(_LOG_RING[-_LOG_RING_MAX:]),
+    }
+
+    if mode == "mv_explore":
+        stop_reason = stat.get("stop_reason")
+        saved = int(stat.get("saved", 0))
+        result["stop_reason"] = stop_reason
+        result["frames_taken"] = int(stat.get("seen", 0))
+        result["frames_saved"] = saved
+        result["frames_skipped_invalid"] = int(stat.get("skipped", 0))
+        result["probe_files"] = [
+            {"name": Path(p).name, "mean": round(float(m), 1), "std": round(float(s), 1)}
+            for p, m, s in stat.get("frame_meta", [])
+        ]
+        if stop_reason in ("max_frames", "error") or saved == 0:
+            result["collection_warn"] = "素材未采全、需重跑"
+
+    (out / "last_result.json").write_text(
+        json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    history = {
+        "timestamp": result["timestamp"],
+        "exit_code": result["exit_code"],
+        "verdict": result["verdict"],
+        "mode": result["mode"],
+        "stop_reason": result.get("stop_reason"),
+        "frames_saved": result.get("frames_saved"),
+    }
+    with (out / "results.jsonl").open("a", encoding="utf-8") as f:
+        f.write(json.dumps(history, ensure_ascii=False) + "\n")
+    return result
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="SongForPrism 自动登录")
     ap.add_argument("--check", action="store_true", help="静态自测后退出（不启动游戏）")
     ap.add_argument("--skip-launch", action="store_true", help="跳过启动，仅附加到已存在窗口")
+    ap.add_argument("--mv-explore", action="store_true",
+                    help="只读旁观采集 MV 六步界面素材（仅内存覆盖 mv_explore=true，不落盘）")
+    ap.add_argument("--mv-enabled", action="store_true",
+                    help="登录成功后自动观看 MV（仅内存覆盖 mv_enabled=true，不落盘）")
     args = ap.parse_args(argv)
 
     cfg = load_settings()
     if args.check:
         return 0 if static_self_check(cfg) else 1
 
+    # ★#46 P1-2★ 命令行开关：仅内存覆盖，绝不写盘；落盘默认值保持不变。
+    # 放在 --check 之后，保证 --check（含 --check --mv-explore）仍用原始配置，[26] 断言不受影响。
+    if args.mv_explore:
+        cfg["flow"]["mv_explore"] = True
+    # ★#49★ 同上：--mv-enabled 仅内存覆盖 flow.mv_enabled，绝不写盘。
+    if args.mv_enabled:
+        cfg["flow"]["mv_enabled"] = True
+
+    t0_48 = time.monotonic()
     _ok, reason = run(cfg, skip_launch=args.skip_launch)
-    return report_result(reason)
+    exit_code = report_result(reason)
+    # ★#48★ 结构化结果落盘（纯旁路）：写失败绝不影响退出码与三态文案。
+    try:
+        write_result_files(cfg, ok=_ok, reason=reason, exit_code=exit_code,
+                           duration_sec=time.monotonic() - t0_48)
+    except Exception as exc:  # noqa: BLE001 - 结果文件是旁路，绝不影响退出码
+        log(f"写结果文件失败（忽略，退出码不变）: {exc}", "WARN")
+    return exit_code
 
 
 if __name__ == "__main__":

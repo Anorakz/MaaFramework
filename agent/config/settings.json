@@ -195,6 +195,93 @@
         "verify_note": "★#21★ 点击后判定窗口：每 1s 采样一帧，先给 30s（in_game_verify_sec）；若窗口到期**画面仍在加载页**则每次延长 30s，最多到 90s（in_game_verify_max_sec，实测加载页可持续数秒~数十秒）。判据：① 命中主界面模板 → OK_MARKER；② 按钮连续 20s（in_game_absent_sec）不可见且当前非加载态 → OK_DEGRADED_UNVERIFIED（仅疑似）；③ 窗口内按钮仍反复可见 → NOT_CONFIRMED；④ 点击后进程/窗口消失（实测点击后客户端会重启）→ 重连，不计判定失败。★若 pipeline 已观察到加载页（loading_seen_after_click=True）说明确实离开了标题，缺席门槛降到 5s（in_game_absent_after_loading_sec）★。post_click_grace_sec=3 用于忽略点击后头 3s 的残留帧（实测点击后 2~6s 内 InGameSuccess 的裸 inverse 就会命中，而那只是标题淡出/立绘轮播：10:26:11、10:28:18 的 screencap 仍是标题 LOGO）。",
         "note": "★兜底参数按 artifacts/06-diagnosis.md §5 第4条校准★ 轮询 2~3s(process_check_interval_sec=2.5)；启动确认超时 20s(window_poll_timeout_sec=20)；窗口连续存活 ≥60s(stable_alive_sec)判定『本次启动可用』——此口径仅用于重启决策/确定性失败标注的观测，★不作为登录前置等待、不是长期保活★；进程消失后等 10~15s(restart_wait_sec=12，等 conhost/UnityCrashHandler64 子进程退出、句柄释放)再重启；最多重启 2 次(max_restarts=2，合计最多 3 次启动)；5~10 分钟内不超过 3 次启动(start_rate_window_sec=600 / max_starts_per_window=3，避免触发 GameGuard 风控)；第 3 次仍在相同时间窗退出 → 判定确定性失败(FAIL_DETERMINISTIC)、停止重试并上报，不无限循环。★重要★：自退时长不固定、实测约 3~6 分钟，形态是静默主动退出非崩溃；进程存活检测必要，但有限重启只保证『至少一次成功启动并完成短动作』，对长期驻留无意义，不要写成长期保活逻辑；每次 os.startfile(<lnk>) 携带同一份静态令牌、不刷新，必然再次自退——绝对不要写任何令牌刷新逻辑。短流程优先：9~12s 到标题画面，尽快完成识别与点击，不以长期驻留为成功前提。",
         "degraded_note": "★三态判定（#21 定稿）★ ① OK_MARKER：主界面模板命中 → 确认进入（退出码 0）。② OK_DEGRADED_UNVERIFIED：点击成功 + 按钮连续 20s 不可见 + 非加载态 + 进程存活，但**没有**正向标志 → 仅『疑似成功』，日志用 WARN 明确标注『未经正向标志确认』，退出码 **3**（既不是 0 也不是普通失败 2）。③ NOT_CONFIRMED：点击未成功或仍停在标题 → 退出码 2。**裸 inverse 单帧命中永不作为成功依据**（实测 10:26:11/10:28:18 判定帧仍是标题 LOGO）。",
-        "stability_note": "★过渡态误判规避(★#21 更新★)★ 点击后游戏进入加载/淡出，按钮会消失，裸 inverse 会立即误报成功。防线：① pipeline 的 [JumpBack]HandleLoadingScreen 放在 WaitInGame.next 第一位，LoadingScreenReco 覆盖 黑(mean<45)/纯白(mean>220 且 std<12)/低方差(std<8)；② 不用全图 pre/post_wait_freezes(立绘轮播干扰，已移除)；③ Python 侧 post_click_verify 点击后持续采样 30s，只有『主界面模板命中(OK_MARKER)』或『按钮连续 20s 不见且非加载态(OK_DEGRADED_UNVERIFIED，仅疑似)』才出结论，单帧按钮缺失一律不算；④ 判定时刻原图存 debug/screencap/in_game_probe_*.png 便于事后复核与裁模板。详见 agent/README.md §5/§11。"
+        "stability_note": "★过渡态误判规避(★#21 更新★)★ 点击后游戏进入加载/淡出，按钮会消失，裸 inverse 会立即误报成功。防线：① pipeline 的 [JumpBack]HandleLoadingScreen 放在 WaitInGame.next 第一位，LoadingScreenReco 覆盖 黑(mean<45)/纯白(mean>220 且 std<12)/低方差(std<8)；② 不用全图 pre/post_wait_freezes(立绘轮播干扰，已移除)；③ Python 侧 post_click_verify 点击后持续采样 30s，只有『主界面模板命中(OK_MARKER)』或『按钮连续 20s 不见且非加载态(OK_DEGRADED_UNVERIFIED，仅疑似)』才出结论，单帧按钮缺失一律不算；④ 判定时刻原图存 debug/screencap/in_game_probe_*.png 便于事后复核与裁模板。详见 agent/README.md §5/§11。",
+        "mv_explore": false,
+        "mv_explore_cfg": {
+            "note": "★#39 方案 B★ MV 探索性实跑采集模式。默认关闭 = 登录链路逐字零回归；开启时仅在 run() 确认 OK_MARKER 后于同一会话内『只读旁观』截屏留证，绝不 post_click / post_task / post_recognition / post_stop / force_foreground / 重启游戏 / 改阈值 / 进登录兜底；不改变三态 0/3/2、不改 report_result 文案、退出码仍 0。用途是采集观看 MV 六步的界面素材，不是 MV 自动化，也不替用户点击任何一步。",
+            "sample_interval_sec": 0.9,
+            "max_duration_sec": 180,
+            "frame_diff_threshold": 12.0,
+            "max_frames": 200,
+            "only_changed_frames": true,
+            "expected_width": 1280,
+            "expected_height": 720,
+            "geometry_tolerance": 4,
+            "black_mean_max": 12.0,
+            "bad_frame_warn_after": 3,
+            "diff_downsample_step": 8,
+            "config_note": "取值依据：sample_interval 0.9s（派单建议 0.8~1.0s，兼顾控制页可能自动隐藏与采样开销）；max_duration 180s（派单建议，可配，独立于登录 overall_timeout_sec=300，用采集自己的单调时钟）；frame_diff_threshold 12.0（1280×720 按步长 8 降为 160×90 灰度后相邻帧平均绝对差，0~255，滤掉立绘轮播/数值微动、保留整页切换）；max_frames 200（★#46 按 32-review.md V2 定量上调★：MV 视频段每帧都变时 60 张仅 54s 即触发 stop_reason=max_frames，高概率在走到第 5/6 步前截断；200 张可覆盖 180s 时长预算，一次采集磁盘约 60~400MB 可接受；收尾若仍为 max_frames 视为未采全、需重跑）；only_changed_frames=true（显著变化帧才留，首帧无条件留作基准）；expected 1280×720±4 与 black_mean_max=12 用于识别『截到终端/全黑/尺寸不符』的无效帧，跳过且不更新差分基准，连续 bad_frame_warn_after=3 帧才 WARN 一次；diff_downsample_step=8。以上参数只影响采集模式，关闭时不读不用。"
+        },
+        "mv_enabled": false,
+        "mv": {
+            "note": "★#49★ MV 自动观看流程（登录确认 OK_MARKER 后在同一次会话内执行）。七步语义（按 17.27~17.28 真实采集素材目视修正，比最初六步多一次返回）：①主界面点右下 Live → ②乐曲选择页点右下「观看MV」 → ③队伍确认页点右下「开始」 → ④MV 载入播放（等待 start 按钮消失 + load_wait_sec）→ 点屏幕唤起控制条 → ⑤点顶部最右 ⏭ 快进键退出 → Loading → ⑥落回乐曲选择页，点左下 ◀ 返回键 → ⑦主界面（marker 三模板正向确认）。★模板与阈值依据（36-ncc.py，半分辨率灰度 NCC，与 match_loading_template 同口径）★ watch：正 0.927/0.932、负 max 0.362 → 0.75；start：正 0.961、负 max 0.314 → 0.75；ff(⏭)：正 1.000、负 max 0.264 → 0.75；back(◀)：正 0.995/1.000、真负样本 max 0.508 → 0.80。★⏭ vs ↺ 专项验证★ 放宽 roi=[1050,0,230,110]（覆盖相邻 ↺ 循环键）下最高分 1.000 仍落在 ⏭ 区域，↺（x≈1102~1167）在正常 roi=[1170,0,110,110] 之外零误命中。★语义注意★ 0004/0005（队伍确认系页面）左下同样存在 ◀ 返回键，back 模板命中它们是正确行为而非误报。★未知项（按未知处理，绝不脑补点击）★ 「乐曲选择 → 主界面」最后一段零素材（采集结束早），该段是否有确认弹窗未知：第 6 步确认超时/意外弹窗一律 WARN+留图 mv_fail_*，绝不猜测点击。★严禁下调阈值★ 严禁为凑命中下调任何 threshold；后续补素材/重校准只可维持或上调。模板一律裁自常驻 UI（按钮/箭头），严禁裁进度条/歌词/立绘等动态内容。",
+            "overall_timeout_sec": 240,
+            "step_timeout_sec": 15,
+            "step_retry": 2,
+            "return_home_confirm_sec": 20,
+            "load_wait_sec": 6.0,
+            "steps": [
+                {
+                    "id": "1_click_live",
+                    "template": ["home_nav_bottom_right.png"],
+                    "threshold": [0.55],
+                    "roi": [[1040, 570, 240, 150]],
+                    "click": "box_center",
+                    "confirm": "mv_watch_button.png"
+                },
+                {
+                    "id": "2_click_watch",
+                    "template": ["mv_watch_button.png"],
+                    "threshold": [0.75],
+                    "roi": [[820, 630, 260, 90]],
+                    "click": "box_center",
+                    "confirm": "mv_start_button.png"
+                },
+                {
+                    "id": "3_click_start",
+                    "template": ["mv_start_button.png"],
+                    "threshold": [0.75],
+                    "roi": [[1030, 630, 250, 90]],
+                    "click": "box_center",
+                    "confirm": "gone",
+                    "post_wait_sec": 6.0
+                },
+                {
+                    "id": "4_tap_screen",
+                    "click": "coord",
+                    "coord": [640, 360],
+                    "confirm": "mv_ff_button.png"
+                },
+                {
+                    "id": "5_click_ff",
+                    "template": ["mv_ff_button.png"],
+                    "threshold": [0.75],
+                    "roi": [[1170, 0, 110, 110]],
+                    "click": "box_center",
+                    "confirm": "mv_watch_button.png"
+                },
+                {
+                    "id": "6_click_back",
+                    "template": ["mv_back_button.png"],
+                    "threshold": [0.8],
+                    "roi": [[0, 630, 110, 90]],
+                    "click": "box_center",
+                    "confirm": "home"
+                }
+            ],
+            "dialog_check": true,
+            "dialogs": [
+                {
+                    "id": "discard_live",
+                    "template": ["mv_dialog_title.png"],
+                    "threshold": [0.75],
+                    "roi": [[220, 160, 850, 90]],
+                    "click_template": ["mv_dialog_discard.png"],
+                    "click_threshold": [0.75],
+                    "click_roi": [[640, 440, 260, 110]],
+                    "note": "★#51★ 「放弃中断Live确认」弹窗：正文=『由于其他设备存在中断中的Live，无法继续。要放弃中断中的数据吗？』+红字『已消耗的LB和道具不会返还』。用户已明确决策：自动点右侧红色「放 弃」继续；左侧白色「返回标题」绝不自动点。模板与阈值依据（38-ncc.py 同口径）：discard 正 0.948 / 真负 max 0.337（10 张 mv_explore 帧+标题+主界面+加载页）→ 0.75；title 正 1.000 / 真负 max 0.408 → 0.75。弹窗背景是模糊主界面，已验证在无弹窗的主界面/乐曲选择帧上零误命中。弹窗出现时留图 tag=mv_dialog_<id>（只新增不覆盖）。点「放 弃」后弹窗仍在/确认仍超时 → 走既有失败路径（retry→FAIL_MV_FLOW），不无限循环。严禁下调阈值。"
+                }
+            ]
+        }
     }
 }

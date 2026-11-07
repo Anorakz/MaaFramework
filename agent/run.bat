@@ -75,6 +75,17 @@ if !errorlevel! NEQ 0 (
 REM ---- Run agent\main.py, forwarding ALL arguments, keep exit code ----
 "!PYEXE!" "agent\main.py" %*
 set "RC=!errorlevel!"
+
+REM ---- #48 crash fallback: unexpected exit code -> minimal last_result.json ----
+REM (0/2/3 are expected; anything else means the interpreter died before writing a result)
+set "CRASH48=1"
+if "!RC!"=="0" set "CRASH48=0"
+if "!RC!"=="2" set "CRASH48=0"
+if "!RC!"=="3" set "CRASH48=0"
+if "!CRASH48!"=="1" (
+    "!PYEXE!" -c "import sys,json,pathlib,datetime; rc=int(sys.argv[1]); p=pathlib.Path('agent/debug/last_result.json'); p.parent.mkdir(parents=True,exist_ok=True); p.write_text(json.dumps({'schema_version':1,'interpreter_crash':True,'exit_code':rc,'timestamp':datetime.datetime.now().isoformat(timespec='seconds'),'verdict':'INTERPRETER_CRASH','mode':'unknown'},ensure_ascii=False),encoding='utf-8')" !RC!
+)
+
 echo.
 echo [DONE] exit code: !RC!
 if not defined SCSP_NO_PAUSE pause

@@ -623,3 +623,246 @@ roi、各自留出 ±0.17 以上余量。h3 对 nav 仅 0.723 是归一化失真
 - **离线证据**：`artifacts/24-verify.py` A 段模拟 `sink.is_success=False` 的重连场景 → 直判命中
   → 退出码 0；B 段验证标题帧/加载页/纯色/marker 失效均不误报；`--check [25]` 验证完整
   override 注入 `post_task` 成功。
+
+## 13. #39 MV 探索性实跑采集模式（方案 B：只留图不改判定）
+
+> **这不是 MV 自动化。** 观看 MV 六步流程（勘察见 `.workbuddy/artifacts/30-mv-survey.md`）的第
+> 2~6 步界面素材为零，无法裁模板、无法确定坐标/是否弹确认框。本模式让用户在管理员终端
+> 手动走完六步时，脚本**旁路只读旁观**录下每个界面的真实 1280×720 帧，供下一阶段裁模板
+> 与语义确认。脚本不替用户点任何一步、不做任何识别/判定、不改阈值、不改三态、不改退出码。
+
+### 13.1 开关与「默认关闭零回归」铁律
+
+`config/settings.json` 的 `flow` 段新增两项（其余既有键逐字未动）：
+
+| 键 | 默认 | 说明 |
+| --- | --- | --- |
+| `flow.mv_explore` | `false` | **默认关闭**。关闭时 `_finish_ok()` 直接 `return True, OK_MARKER`，不截图、不留图、不写任何日志、不改变时序 → 与 #33 基线（两轮实跑 `OK_MARKER`/exit 0）逐字零回归。 |
+| `flow.mv_explore_cfg` | 见下表 | 采集参数，仅在开启时读取；关闭时不读不用。 |
+
+| `mv_explore_cfg` 键 | 取值 | 依据 |
+| --- | --- | --- |
+| `sample_interval_sec` | `0.9` | 派单建议 0.8~1.0s；兼顾控制页可能自动隐藏与采样开销 |
+| `max_duration_sec` | `180` | 可配；用采集自己的单调时钟，不受登录 `overall_timeout_sec=300` 影响 |
+| `frame_diff_threshold` | `12.0` | 1280×720 按步长 8 降为 160×90 灰度后相邻帧平均绝对差（0~255），滤掉立绘轮播/数值微动、保留整页切换 |
+| `max_frames` | `200` | ★#46 上调★ 硬闸，防磁盘爆（单张 1280×720 PNG 约 0.3~2MB）。`32-review.md` V2 定量：MV 视频段每帧都变时 `60` 张仅 54s 即 `stop_reason=max_frames` 提前截断、采不到第 5/6 步；`200` 可覆盖 180s 时长预算 |
+| `only_changed_frames` | `true` | 显著变化帧才留；首帧无条件留作差分基准 |
+| `expected_width/height`、`geometry_tolerance` | `1280/720/±4` | 识别「截到终端/尺寸不符」的无效帧 |
+| `black_mean_max` | `12.0` | 全黑/极暗帧判为无效 |
+| `bad_frame_warn_after` | `3` | 连续 3 帧无效才 WARN 一次（不刷屏） |
+| `diff_downsample_step` | `8` | 差分降采样步长 |
+
+`recognition.in_game_marker_*` 三数组、`[0.55,0.75,0.6]`、`<0.55` 下限守护、
+`controller`、`launch`、三态相关配置**一字未动**；`resource/pipeline/login.json` 10 节点**未改**。
+三处 `return True, OK_MARKER` 全部改为 `return _finish_ok(...)`，但 `_finish_ok` 默认分支仍
+直接返回 `OK_MARKER`，故 `[22]` 既有断言与成功日志行均不变。
+
+**★#46 命令行开关（首选）★**：`--mv-explore`（`agent\run.bat --mv-explore`，`run.bat` 末行 `%*` 透传全部参数，
+已实测）。它在 `main()` 里**仅内存覆盖** `cfg["flow"]["mv_explore"] = True`，**绝不写盘**；落盘默认值恒为
+`false`，因此没有「手改配置改错行 / 忘记改回 false / CRLF 编辑器导致整文件 diff」三种风险，git 工作区
+始终保持可比对。`--check`（含 `--check --mv-explore`）仍走原始配置，`[26]` 断言不受影响。
+**手改 `settings.json` 的方式不再推荐。**
+
+### 13.2 管理员终端实跑命令与操作清单（★#46 两步，命令行开关优先★）
+
+> 完整清单以 `.workbuddy/artifacts/33-fix.md` 为准；本节为摘要。**先做第 1 次默认关闭实跑**
+> （验证零回归），再做第 2 次采集实跑；顺序不能反（#33 两轮实跑都在 #39 改动之前，
+> 静态证明不替代真实实跑；采集实跑只覆盖开启分支，不覆盖默认关闭分支）。
+
+**第 1 次｜默认关闭，验证零回归（必须，且放在采集之前）**
+
+1. 右键「Windows 终端 / PowerShell」→ **以管理员身份运行**；`cd /d D:\DMM\scsp_MAA`。
+2. 执行 `agent\run.bat`（配置保持 `mv_explore=false`、**不带任何开关**）。
+3. 确认终局 `结果: 成功（已确认进入主界面） [OK_MARKER] 退出码 0`、日志与 #33 两轮一致 → 回传终端输出。
+
+**第 2 次｜采集**
+
+4. 执行 `agent\run.bat --mv-explore`（等价于 `python agent\main.py --mv-explore`）。
+   **不要手改 `settings.json`**。
+5. 等终端打印「【MV 探索性实跑采集模式】已启动」与六步提示 → **切到游戏窗口、把管理员终端最小化**、
+   保持游戏在前台。手动依次完成六步：① 点右下角 Live → ② 点「观看 MV」 → ③ 点「开始」 →
+   ④ 点屏幕唤起控制页 → ⑤ 点右上角最右边的快进键退出 MV → ⑥ 点左下角返回键回到主页面。
+6. ★**MV 播放段请尽快完成第 4/5/6 步，不要等 MV 播完**★（视频段每帧都变，留图额度消耗最快；
+   第 4/5/6 步界面正是本次采集唯一目的）。采集上限已放宽到 200 张，但回传前请按 0001..N 顺序
+   目视剔除重复帧与终端/桌面帧。
+7. 走完六步切回终端按 **Ctrl+C**（或等自动结束：180s / 200 张 / 游戏退出）；确认仍 `OK_MARKER`/exit 0。
+8. 回传 `agent\debug\screencap\` 下本次 `in_game_probe_*_mv_explore_*.png` **全部**（按 0001..N 顺序）
+   + 收尾统计（**含 `stop_reason`**）。★若 `stop_reason=max_frames`，说明额度耗尽、可能没走到第 5/6 步
+   → 素材未采全，需重跑★。并附 4 项语义确认（见 `33-fix.md`）。
+
+### 13.3 留图命名、位置与 Foreground 截图风险
+
+- 命名：`in_game_probe_<时间戳>_mv_explore_0001.png`（序号 4 位递增），落在
+  `agent/debug/screencap/`，**只新增不覆盖**，便于按序对照六步。
+- 收尾统计**必打印 `stop_reason`**（`max_duration` / `max_frames` / `ctrl_c` / `process_gone` / `error`）；
+  `max_frames` 与 `error` 额外 WARN「素材未采全、需重跑」。留图清单对每张附灰度 `mean/std`，
+  便于按序识别并剔除明显是终端/桌面的帧（不引入终端内容启发式，避免误杀游戏内纯色 UI）。
+- `controller.screencap="Foreground"`（DXGI_DesktopDup_Window|ScreenDC）依赖游戏窗口前台。
+  用户手动点游戏时窗口自然前台；但**管理员终端被切到前台**时可能截到终端/黑帧。处理：
+  观察循环内**不调用 `force_foreground(hwnd)`**（会抢焦点、干扰手动点击）；对空帧 / 全黑 /
+  尺寸非 1280×720±4 的帧直接跳过、不存图、不更新差分基准，连续 `bad_frame_warn_after`
+  帧才 WARN 一次并提示保持游戏在前台。**不擅自改 `controller.screencap` 全局值**
+  （会牵动登录链路与 `--check [3]` 断言）。代价：终端抢前台的那几秒可能丢素材，
+  用户按 13.2 第 5 条把终端最小化、保持游戏在前台即可覆盖。
+- 结束条件：Ctrl+C（优雅收尾、不吞掉后继续跑）、总时长上限、最大留图数、或
+  `monitor.alive()` 为假（游戏自退时立刻收尾并如实提示）。任何情况均返回统计并仍
+  `OK_MARKER`/exit 0。
+
+### 13.4 验收（全部离线）
+
+`python agent\main.py --check` → EXIT=0，`[14]` 真实 bundle post_bundle 成功、无 OCR 报错、
+`[22]/[24]/[25]/[26]` 全过（`[26]` 含 #46 的 `max_frames>=200` 与 `--mv-explore` 开关断言）；
+`.workbuddy/artifacts/31-verify.py` 用合成帧序列驱动 12 组断言（含 #46 新增：
+`--mv-explore` 仅内存覆盖不落盘、`max_frames=200` 视频帧序列跑到 `stop_reason=max_duration`）全过。
+#45 复核见 `.workbuddy/artifacts/32-review.md`，#46 修复与最终两步实跑清单见
+`.workbuddy/artifacts/33-fix.md`；初版实跑清单（`31-mv-explore.md §9`）
+**已被 32-review.md / 33-fix.md 取代**。
+
+## 14. #48 实跑结果结构化输出（L2，主 agent 直接读文件判读）
+
+每次**真实实跑**（`agent\run.bat`，不带 `--check`）结束后，脚本在 `agent/debug/` 下自动落两份机器可读结果，
+无需用户手动贴日志：
+
+| 文件 | 语义 | 写入时机 |
+| --- | --- | --- |
+| `agent/debug/last_result.json` | **覆盖写**，"最新一次"实跑的完整结果 | `main()` 拿到 `report_result()` 退出码后、进程退出前 |
+| `agent/debug/results.jsonl` | **只追加**，每次一行精简历史 | 同上，逐次追加 |
+
+两份都在已被 git 忽略的 `agent/debug/`，不入库、不影响 diff。
+
+### 14.1 `last_result.json` 字段
+
+| 字段 | 说明 |
+| --- | --- |
+| `schema_version` | 固定 `1` |
+| `timestamp` | ISO 本地时间（秒精度），用于判断结果新鲜度 |
+| `duration_sec` | 本次 `run()` 耗时（秒） |
+| `exit_code` | 0 / 2 / 3（或异常码） |
+| `verdict` | `OK_MARKER` / `OK_DEGRADED_UNVERIFIED` / `NOT_CONFIRMED` / `FAIL_*` |
+| `terminal_text` | 终端那句「结果: …」原文（取自最近日志环形缓存，便于核对文案） |
+| `mode` | `login` 或 `mv_explore`（读**生效值**；`--mv-explore` 仅内存覆盖也算 `mv_explore`） |
+| `login_ok` | 布尔：**登录是否成功**，与「MV 采集是否完整」刻意分离 |
+| `config_snapshot` | `mv_explore` / `max_frames` / `max_duration_sec` / `sample_interval_sec` / `in_game_marker_threshold` 只读快照 |
+| `key_log_lines` | 最近 30 条日志行数组 |
+| 仅 `mode=mv_explore` 时：`stop_reason` | `ctrl_c` / `max_duration` / `max_frames` / `process_gone` / `error` |
+| 仅采集：`frames_taken` / `frames_saved` / `frames_skipped_invalid` | 取帧数 / 留图数 / 跳过无效帧数 |
+| 仅采集：`probe_files` | 按 0001..N 顺序的 `{name, mean, std}` 数组（沿用 #46 的灰度 mean/std） |
+| 仅采集：`collection_warn` | 若 `stop_reason=max_frames` / `error` / `saved=0`，写明「素材未采全、需重跑」 |
+
+关闭采集（`mode=login`）时**不含任何采集字段**。`results.jsonl` 每行精简为
+`timestamp / exit_code / verdict / mode / stop_reason / frames_saved`。
+
+### 14.2 主 agent（或用户）如何读
+
+```bash
+# 读最新一次完整结果（推荐）
+python -c "import json; d=json.load(open('agent/debug/last_result.json',encoding='utf-8')); print(d['verdict'], d['exit_code'], d['mode'], d.get('stop_reason'), d.get('collection_warn'))"
+
+# 直接看完整 JSON（记事本 / VS Code 亦可打开）
+cat agent/debug/last_result.json
+
+# 看多轮历史（每次一行）
+tail -n 5 agent/debug/results.jsonl
+```
+
+### 14.3 判读要点
+
+- `login_ok=true` + `verdict=OK_MARKER` + `exit_code=0` → 登录成功；`login_ok` 与采集完整性**互不干扰**
+  （采集 `stop_reason=max_frames` 时登录仍可 `exit 0`）。
+- ★**`stop_reason=max_frames`（或 `error` / `frames_saved=0`）→ 素材未采全、需重跑**★，
+  结果文件里 `collection_warn` 会直接写明；按 `33-fix.md §5` 的两步清单重做采集。
+- `interpreter_crash: true` → `run.bat` 的崩溃兜底：python 以非 `0/2/3` 退出码结束时写的最小结果，
+  表示"进程异常结束、没有正常结果"，主 agent 应排查而非当作成功。
+- **`--check` 路径不写结果文件**（静态自测不是实跑）；也不删除既有的 `last_result.json`，
+  主 agent 请以 `timestamp` 判断是否是本次实跑产生的新鲜结果。
+
+### 14.4 L0 聚合验证入口（可选但推荐）
+
+`python agent\tools\verify_all.py` 一条命令跑完
+`main.py --check` + `31-verify.py` + `git diff --check` + `git status --short`，
+打印 PASS/FAIL 列表与总退出码（0=全过）。**只读，不改任何源文件**；
+用带 maafw 的解释器执行。主 agent 每次改完代码直接跑这一条即可。
+
+### 14.5 不变量
+
+写结果是**纯旁路**：任何写文件异常都被 `main()` 吞掉并 WARN，**绝不改变退出码、三态文案、
+登录/判定/采集行为**；`--check [1]~[26]` 既有断言未动，只追加 `[27]`（真调用
+`write_result_files` 验证字段、覆盖写/追加、崩溃兜底）。详见 `.workbuddy/artifacts/35-result-json.md`。
+
+## 15. #49 MV 自动观看流程（mv_enabled，登录成功后自动跑，默认关闭）
+
+登录确认 `OK_MARKER` 后、在同一次会话内自动执行「观看 MV」七步流程并回到主界面。
+**默认关闭**（`flow.mv_enabled=false`）：关闭时 `_finish_ok` 双关闭分支直接返回，
+行为与当前逐字一致（零回归）。实跑用命令行开关：`agent\run.bat --mv-enabled`
+（仅内存覆盖，不落盘；与 `--mv-explore` 同款机制，手改配置不再推荐）。
+**`--mv-enabled` 与 `--mv-explore` 不要同时开**：采集是「用户手动走」模式，与脚本自动点击
+互斥，同时开时采集优先、自动流程跳过并 WARN。
+
+### 15.1 七步语义（按 17.27~17.28 真实采集素材目视修正，比最初六步多一次返回）
+
+| 步 | id | 动作 | 模板（roi / 阈值） | 点击后正向确认 |
+| --- | --- | --- | --- | --- |
+| ① | `1_click_live` | 主界面点右下 Live | `home_nav_bottom_right.png`（[1040,570,240,150] / 0.55，复用主界面判定模板） | `mv_watch_button.png` 出现（进入乐曲选择页） |
+| ② | `2_click_watch` | 乐曲选择页点右下「观看MV」 | `mv_watch_button.png`（[820,630,260,90] / 0.75） | `mv_start_button.png` 出现（进入队伍确认页） |
+| ③ | `3_click_start` | 队伍确认页点右下「开始」 | `mv_start_button.png`（[1030,630,250,90] / 0.75） | `gone`（开始按钮消失=已离开）+ `post_wait_sec=6.0`（MV 载入） |
+| ④ | `4_tap_screen` | 点屏幕中心 (640,360) 唤起控制条 | coord 点击（先做 1280×720±4 几何守卫，绝不按错误坐标乱点） | `mv_ff_button.png` 出现（控制条唤起） |
+| ⑤ | `5_click_ff` | 点顶部最右 ⏭ 快进键退出 MV | `mv_ff_button.png`（[1170,0,110,110] / 0.75） | `mv_watch_button.png` 出现（落回乐曲选择页） |
+| ⑥ | `6_click_back` | 乐曲选择页点左下 ◀ 返回键 | `mv_back_button.png`（[0,630,110,90] / 0.80） | **主界面**（marker 三模板正向确认 + 留图 `mv_return_home`） |
+
+每步：`force_foreground` → 截帧 → 模板判定 → **box_center 精确点击**（不用 `target:true` 的
+rand_point）→ 轮询正向确认（`step_timeout_sec=15`）→ 超时按 `step_retry=2` 重试 → 失败留图
+`mv_fail_<step>` 并 WARN。整体预算 `overall_timeout_sec=240`（重试期间同样受约束）；
+`monitor.alive()` 为假立即中止。任何失败都**不重启游戏、不改阈值、不进登录兜底**。
+
+### 15.2 模板与阈值依据（`36-ncc.py`，半分辨率灰度 NCC，与 `match_loading_template` 同口径）
+
+| 模板 | 来源帧 | 正样本 min | 真负样本 max | 阈值 | 余量 |
+| --- | --- | --- | --- | --- | --- |
+| `mv_watch_button.png`（195×53） | 0003 乐曲选择 | 0.927（0010=0.932 交叉） | 0.362 | **0.75** | +0.18 / −0.39 |
+| `mv_start_button.png`（195×53） | 0005 队伍确认 | 0.961 | 0.314 | **0.75** | +0.21 / −0.44 |
+| `mv_ff_button.png`（62×62，⏭） | 0008 控制条 | 1.000 | 0.264 | **0.75** | +0.25 / −0.49 |
+| `mv_back_button.png`（52×52，◀） | 0003 乐曲选择 | 0.995（0010=1.000 交叉） | 0.508 | **0.80** | +0.20 / −0.29 |
+
+- ★⏭ vs ↺ 专项验证★：放宽 roi=[1050,0,230,110]（覆盖相邻 ↺ 循环键）下最高分 1.000 仍落在
+  ⏭ 区域；↺（x≈1102~1167）在正常 roi=[1170,0,110,110] 之外，零误命中。
+- 语义注意：0004/0005（队伍确认系页面）左下同样存在 ◀，back 模板命中它们是**正确行为**而非误报；
+  真负样本（页面上无该按钮的帧）max=0.508（主界面帧）。
+- ★严禁下调阈值★：后续补素材/重校准只可维持或上调；模板一律裁自常驻 UI（按钮/箭头），
+  严禁裁进度条/歌词/立绘等动态内容。
+
+### 15.3 结果码与未知项（如实声明）
+
+- 流程成功 → 仍 `OK_MARKER` / exit 0；业务失败（步骤重试耗尽 / 整体超时 / 进程退出）→ 新增
+  `FAIL_MV_FLOW` → 走 `report_result` else 分支 → **exit 2**（#34 §5.3 选项 B；三态 0/3/2 与
+  文案一字未改）。终端文案为「结果: 失败（MV_FLOW_FAILED） 退出码 2」，日志 WARN 明确
+  「登录已成功；按选项 B 上报」。意外异常一律吞掉 + WARN + 留图 `mv_fail_exception`，仍
+  `OK_MARKER`/exit 0（不把登录成功降级）。
+- ★未知项★：「乐曲选择 → 主界面」最后一段零素材（采集结束早），该段**是否有确认弹窗未知**。
+  第 ⑥ 步确认超时/意外弹窗一律 WARN + 留图 `mv_fail_6_click_back`，**绝不脑补点击**；
+  首次实跑若在此失败，把 `agent/debug/screencap/` 的 `mv_fail_*.png` 回传即可补齐素材。
+- 验收：`--check [28]`（配置/模板/默认关闭/confirm 链/接入/三态/失败路径真调用）+
+  `36-verify.py`（16 项断言：真实 bundle 七步走通、confirm 超时、home 不确认、进程退出、
+  整体超时、FAIL_MV_FLOW、`_finish_ok` 三分支重建闭包驱动）全过；详见
+  `.workbuddy/artifacts/36-mv-flow.md`。
+
+### 15.4 ★#51★ 弹窗处理（放弃中断Live确认，dialog_check=true）
+
+#50 首次真实实跑（19:22）发现：点 Live 后可能弹出「**放弃中断Live确认**」模态框
+（正文『由于其他设备存在中断中的Live，无法继续。要放弃中断中的数据吗？』+ 红字
+『已消耗的LB和道具不会返还』，左「返回标题」白 / 右「**放 弃**」红）。
+**用户已明确决策：自动点「放 弃」继续**；「返回标题」绝不自动点。
+
+- 配置：`flow.mv.dialog_check=true` + `flow.mv.dialogs[]`（id=`discard_live`：
+  识别用 `mv_dialog_title.png`（793×38 蓝条标题，[220,160,850,90] / 0.75），
+  点击用 `mv_dialog_discard.png`（208×62 红按钮，[640,440,260,110] / 0.75）。
+  NCC：discard 正 0.948 / 真负 max 0.337；title 正 1.000 / 真负 max 0.408
+  （`38-ncc.py`；弹窗背景是模糊主界面，已验证在无弹窗帧上零误命中）。
+- 行为：确认等待循环（第 ①③④⑤⑥ 步全部）每次采样先过 `_check_dialog` 钩子 ——
+  命中弹窗 → WARN + 留图 `mv_dialog_<id>` → box_center 点「放 弃」→ 继续原确认链；
+  同一弹窗**最多自动点 3 次**（防快速连点，超限只 WARN 交由超时/重试）；点后弹窗仍在/
+  确认仍超时 → 走既有失败路径（retry → `FAIL_MV_FLOW`），不无限循环；点击按钮未命中时
+  不脑补点击。
+- login_ok 分离（★#51 修复★）：#50 实跑暴露 `login_ok=bool(ok)` 在 `FAIL_MV_FLOW`
+  时误为 False（登录 19:22:19 已 `OK_MARKER` 成功）。已修为
+  `login_ok = ok or (reason == FAIL_MV_FLOW)` —— 登录事实不被 MV 附加流程结果覆盖；
+  `--check [27](e)` 与 `36-verify.py` I 段断言守护。
