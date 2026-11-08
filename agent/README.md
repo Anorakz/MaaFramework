@@ -663,6 +663,21 @@ roi、各自留出 ±0.17 以上余量。h3 对 nav 仅 0.723 是归一化失真
 始终保持可比对。`--check`（含 `--check --mv-explore`）仍走原始配置，`[26]` 断言不受影响。
 **手改 `settings.json` 的方式不再推荐。**
 
+**★#66 采集上限命令行覆盖（大流程必备）★**：单次走路的自动育成可能 5~10 分钟，落盘默认
+`max_duration_sec=180` / `max_frames=200` 不够时，用命令行按需放大，**不要手改 `settings.json`**：
+
+| 开关 | 覆盖项 | 取值约束 |
+| --- | --- | --- |
+| `--explore-max-duration <SEC>` | `flow.mv_explore_cfg.max_duration_sec` | 大于 0 的有限秒数（支持小数，如 `600` / `2.5`） |
+| `--explore-max-frames <N>` | `flow.mv_explore_cfg.max_frames` | 整数且 `>= 1` |
+
+例：`agent\run.bat --mv-explore --explore-max-duration 900 --explore-max-frames 800`。
+两个开关与 `--mv-explore` 同款机制：在 `main()` 里**仅内存覆盖**、**绝不写盘**（覆盖调用在
+`if args.check` 之后，`--check` 路径不受影响），不带开关时行为逐字不变。非法值（`0`/负数/
+`NaN`/`inf`/非数字，以及 `frames < 1`）→ `argparse` 打印用法并 **exit 2**，绝不带着非法上限继续跑。
+注意留图额度与磁盘：单张 1280×720 PNG 约 0.3~2MB，`800` 张约 0.24~1.6GB。
+验收：`--check [31]` + `.workbuddy/artifacts/50-explore-verify.py`（真驱动 `main()`，A~G 段）。
+
 ### 13.2 管理员终端实跑命令与操作清单（★#46 两步，命令行开关优先★）
 
 > 完整清单以 `.workbuddy/artifacts/33-fix.md` 为准；本节为摘要。**先做第 1 次默认关闭实跑**
@@ -882,7 +897,7 @@ rand_point）→ 轮询正向确认（`step_timeout_sec=15`）→ 超时按 `ste
 | ② | `2_click_decide` | 乐曲选择页点「決定」 | `play_decide_button.png`（[1030,630,250,90] / 0.75） | `play_skip_button` 出现 |
 | ③ | `3_click_skip` | 队伍确认页点「跳过」 | `play_skip_button.png`（[1090,630,190,90] / **0.85**） | `play_dialog_title` 出现 |
 | ④ | `4_dialog_start` | 弹窗点「開 始」 | `play_start_button.png`（[620,630,260,90] / 0.75）+ **precheck** | `play_result_title` 出现 |
-| ⑤ | `5_click_ok` | 結果页点「OK」 | `play_ok_button.png`（[500,640,280,80] / 0.75） | `play_skip_button` 出现（回队伍确认页） |
+| ⑤ | `5_click_ok` | 結果页点「OK」（**模板数组任一命中**；ok2 为常态頁第二裁切，对偶像升级变体布局页有效性待取证——见下方勘误） | `play_ok_button.png` + `play_ok_button2.png`（各 [500,640,280,80] / 0.75） | `play_skip_button` 出现（回队伍确认页） |
 | ⑥ | `6_back_team` | 队伍确认页点 ◀ | `mv_back_button.png`（[0,630,110,90] / 0.75） | `play_decide_button` 出现 |
 | ⑦ | `7_back_song` | 乐曲选择页点 ◀ | `mv_back_button.png`（同上 / 0.75） | home（Loading→主界面） |
 | ⑧ | `8_confirm_home` | 纯确认（click=none） | — | home（幂等二次确认） |
@@ -894,7 +909,8 @@ rand_point）→ 轮询正向确认（`step_timeout_sec=15`）→ 超时按 `ste
 | `play_decide_button`（195×52） | 0.893 | 0.608 | 0.75 |
 | `play_skip_button`（115×30，只裁『跳过』避开数字） | 0.973（剩余 9/10/8 次三帧全过） | 0.714 | **0.85** |
 | `play_start_button`（205×52） | 1.000 | 0.443 | 0.75 |
-| `play_ok_button`（200×42） | 0.894 | 0.385 | 0.75 |
+| `play_ok_button`（200×42，常态結果页） | 0.894 | 0.385 | 0.75 |
+| `play_ok_button2`（208×54，裁自 22.16.38 留图） | 0.966（对常态頁交叉 0.875） | 0.544 | 0.75 |
 | `play_dialog_title`（258×30） | 1.000 | 0.479 | 0.75 |
 | `play_result_title`（326×29） | 0.946 | 0.338 | 0.75 |
 | `play_max_checked`（60×33，勾选态） | 0.972 | 0.599 | 0.80 |
@@ -916,8 +932,49 @@ rand_point）→ 轮询正向确认（`step_timeout_sec=15`）→ 超时按 `ste
 
 ### 16.4 边界与未知项（按未知处理，绝不脑补）
 
+**★勘误（#61 实证）★ 偶像升级变体页**：22.16.38 失败留图经 #61 实证为 **attempt 点击前缓存帧
+（常态結果页）**，非变体布局页——play_ok_button2 实为常态頁第二裁切（与 ok 同帧不同 y 区域，
+box 中心差 2px），对真正升级变体布局页的有效性**未验证**（真正变体页素材当时零采集，系旧失败
+留图时机存缓存帧所致，已由 P2-1 修复：失败留图改用最后采样帧）。第⑤步模板数组任一命中机制
+保留；变体页之后是否还有别的页、点其 OK 后是否直达队伍确认页、升级多级时页面是否更多均未知
+（confirm=skip 天然容忍中间任意页数），待取证素材到位后评估 ok2 是否重裁。
 常に最大未勾选态零素材（precheck 降级设计）；跳过剩余 0 次时点跳过的行为未知（安全中止）；
 LB=0 时流程会在某步失败（安全中止，**LB 道具恢复明确不做**，0021~0022 素材不作实现依据）；
 結果页 SS 评级/偶像数值为动态内容严禁裁模板；弹窗「取消」、队伍确认页「自動 剩余20次」粉钮
 一律不点；跨会话/曲目/难度泛化未验证。验收：`--check [29]` + `40-verify.py`（17 项断言）；
 详见 `.workbuddy/artifacts/40-play-flow.md`。
+
+## 17. #64 登录确认阶段通用弹窗清除（popup_clear，仅自动流程启用）
+
+**实证背景**：23:35 实跑（--play-enabled）登录点击后 19 次采样 26.8s 主界面 marker 不命中 →
+OK_DEGRADED_UNVERIFIED exit 3，打歌流程按设计未启动。unverified 留图实证根因 = **每日登录奖励
+弹窗（デイリーログインボーナス）遮挡主界面**（游戏日 0:00 JST 跨天当日首次登录触发，GET! 图章+
+奖励板全屏遮挡、无专用 × 钮）；23:42 探针普通登录 6.4s OK_MARKER（弹窗已领取，每游戏日一次）。
+这是 #55 备案「跨会话/活动弹窗泛化」缺口的首次真实触发。
+
+### 17.1 触发条件与动作（post_click_verify 采样循环内，判定三态逻辑零改动）
+
+触发条件**全部满足**才点击：①点击后已过 `min_wait_sec`（8.0s）；②当前非加载态；③主界面
+marker 未命中；④标题按钮不可见。动作：按 `interval_sec`（3.0s）连续 `coord` 点击
+（默认屏幕中心 [640,360]），每次点击前 WARN + 留图 `popup_tap_<n>`（#62 最后采样帧机制=
+点击前画面）；点击后继续正常采样，**marker 命中立即停止并正常确认**；`taps` 上限（4）用尽
+仍未命中 → **维持现有降级结论**（OK_DEGRADED_UNVERIFIED / LEFT_TITLE，绝不因点击误判成功）。
+
+### 17.2 门控红线与配置
+
+| 项 | 值 |
+| --- | --- |
+| `flow.popup_clear.enabled` | true（总开关，但见下方门控） |
+| `flow.popup_clear.taps` / `interval_sec` / `coord` / `min_wait_sec` | 4 / 3.0 / [640,360] / 8.0（全可配） |
+| **生产有效门控（两条）** | `popup_clear.enabled=true` **且** `mv_enabled or play_enabled` 任一开启 |
+| **第三重防御（离线路径）** | `click_fn` 未注入时额外禁用——`run()` 无条件注入，故该条只在 `--check`/离线探针（不注入 `click_fn`）生效；本轮 `--check [30]` 已改为行为级断言 |
+
+**普通登录（无 flow 开启）→ 有效门控不满足 → 行为逐字零回归**（两轮实跑验证的链路一字未动；本文案按 #68 F3 勘正为与实现一致的「两条」表述）。
+配置位于 `flow.popup_clear`（与 mv/play 平级）。
+
+### 17.3 坐标风险评估（如实）
+
+若误判（无弹窗却点击），主界面中心 [640,360] 落点对照 `22-manual-1280.png` = 房间场景中部
+角色立绘区（非按钮/导航/图标）——点击无 UI 交互或仅触发无害对话气泡；兜底 = marker 命中即停 +
+taps 上限 4 + WARN + 逐次留图。验收：`--check [30]` + 40-verify M 段（M1 弹窗 4 次内命中即停 /
+M2 永不消失安全降级 / M3 普通登录门控零点击零留图）；详见 `.workbuddy/artifacts/48-popup-clear.md`。

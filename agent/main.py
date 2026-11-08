@@ -1246,7 +1246,8 @@ def make_marker_hit_fn(tasker: Tasker, cfg: dict):
 def post_click_verify(cfg: dict, *, screencap_fn, is_alive_fn, button_visible_fn,
                       marker_hit_fn=None, probe_fn=None, log_fn=None,
                       loading_seen_before: bool = False,
-                      now_fn=time.monotonic, sleep_fn=time.sleep) -> tuple[str, str]:
+                      now_fn=time.monotonic, sleep_fn=time.sleep,
+                      click_fn=None) -> tuple[str, str]:
     """★#21★ 点击后 20~30s 持续采样，给出三态判定的「结论」，由 run() 映射成结果码。
 
     verdict:
@@ -1271,8 +1272,23 @@ def post_click_verify(cfg: dict, *, screencap_fn, is_alive_fn, button_visible_fn
     # 缺席门槛可以缩短（加载结束本身就是强证据），否则仍要求完整的连续缺席时长。
     if loading_seen_before:
         absent_need = min(absent_need, float(flow.get("in_game_absent_after_loading_sec", 5)))
+    # ★#68 F1★ 缺席门槛是否被缩短（决定 popup 点击后是否重置缺席计时，见 popup 分支说明）
+    absent_shortened = loading_seen_before
     interval = float(flow.get("verify_sample_interval_sec", 1.0))
     grace = float(flow.get("post_click_grace_sec", 3.0))
+    # ★#64★ popup_clear 门控：生产有效门控 = enabled 且 mv/play 任一开启（run() 无条件注入
+    # click_fn）；click_fn 未注入时额外禁用，是 --check/离线路径的第三重防御。
+    # 普通登录（无 flow 开启）门控不满足 → 行为逐字零回归（两轮实跑验证的链路）。
+    popup_cfg = flow.get("popup_clear") or {}
+    popup_enabled = (bool(popup_cfg.get("enabled", False))
+                     and click_fn is not None
+                     and (mv_flow_enabled(cfg) or play_flow_enabled(cfg)))
+    popup_min_wait = float(popup_cfg.get("min_wait_sec", 8.0))
+    popup_interval = float(popup_cfg.get("interval_sec", 3.0))
+    popup_coord = popup_cfg.get("coord") or [640, 360]
+    popup_taps = int(popup_cfg.get("taps", 4))
+    taps_used = 0
+    last_tap_at = None                      # ★#64★ 上次 popup 点击时刻（interval 间隔控制）
 
     start = now_fn()
     absent_since = None
@@ -1307,6 +1323,40 @@ def post_click_verify(cfg: dict, *, screencap_fn, is_alive_fn, button_visible_fn
             return "MARKER", f"第 {samples} 次采样命中正向主界面模板（{elapsed:.1f}s）"
 
         vis = bool(button_visible_fn(frame))
+
+        # ★#64★ 登录确认阶段通用弹窗清除（popup_clear）：每日登录奖励/活动公告等全屏
+        # 弹窗遮挡主界面时，用户确认的关闭交互 = 连点屏幕依次关闭（无专用 × 钮）。
+        # 触发条件全满足才点击：过 min_wait_sec + 非加载态 + marker 未命中 + 按钮不可见；
+        # 每次点击前 WARN+留图 popup_tap_<n>（#62 最后采样帧机制=点击前画面）；
+        # 点击后继续正常采样，marker 命中立即停止并正常确认；taps 用尽→维持现有降级结论。
+        if (popup_enabled and taps_used < popup_taps and elapsed >= popup_min_wait
+                and (last_tap_at is None or now_fn() - last_tap_at >= popup_interval)
+                and not loading and not vis):
+            taps_used += 1
+            last_tap_at = now_fn()
+            log_fn(f"  ★popup_clear：主界面疑似被弹窗遮挡（marker 未命中/按钮不可见，"
+                   f"t={elapsed:.1f}s），按用户语义连点屏幕关闭（第 {taps_used}/{popup_taps} 次）",
+                   "WARN")
+            if probe_fn:
+                try:
+                    probe_fn(frame, f"popup_tap_{taps_used}")
+                except Exception as exc:  # noqa: BLE001 - 留图失败不影响清除
+                    log_fn(f"  popup_clear 留图异常（忽略）: {exc}", "WARN")
+            try:
+                click_fn(int(popup_coord[0]), int(popup_coord[1]))
+            except Exception as exc:  # noqa: BLE001 - 点击失败继续采样
+                log_fn(f"  popup_clear 点击异常（继续采样）: {exc}", "WARN")
+            # ★#68 F1★ 点击后重置「连续不可见」计时基准：loading_seen_before=True 时
+            # absent_need 被缩短到 5s，点击前累计的缺席时长会在下一次采样立即凑满，
+            # 抢在 taps 用完前收口为 LEFT_TITLE（实测只点 1 次就把剩余 3 次吞掉）。
+            # 仅在缩短门槛路径重置：默认 20s 门槛下若也重置，4 次点击（≈12s）后需再等
+            # 20s 才够，会超出 30s 判定窗口 → LEFT_TITLE 变 TIMEOUT（exit 3→2），
+            # 属三态语义变化，本修复不取。三态判定与成功判据、taps/预算语义均不变。
+            if absent_shortened:
+                absent_since = None
+            sleep_fn(interval)
+            continue
+
         if elapsed >= grace:
             if vis:
                 last_visible_at = elapsed
@@ -1586,8 +1636,9 @@ def play_flow_enabled(cfg: dict) -> bool:
 def _mv_match(tasker, frame, tpl: str, threshold: float, roi):
     """★#49★ MV 单模板判定（同 make_marker_hit_fn 的 post_recognition 机制）。
 
-    返回 (hit, box_center)：box_center 为截图缩放坐标 (cx, cy)（post_click 期望缩放坐标，
-    同 ClickCenterAction 的 box 中心算法）；未命中 / 异常一律 (False, None)，绝不误报。
+    返回 (hit, box_center, score)：box_center 为截图缩放坐标 (cx, cy)（post_click 期望
+    缩放坐标，同 ClickCenterAction 的 box 中心算法）；score 为模板匹配分（框架未提供时 1.0）；
+    未命中 / 异常一律 (False, None, 0.0)，绝不误报。
     """
     from maa.pipeline import JRecognitionType, JTemplateMatch
     try:
@@ -1601,18 +1652,38 @@ def _mv_match(tasker, frame, tpl: str, threshold: float, roi):
         detail = job.get()
         nid = detail.node_id_list[0] if (detail and getattr(detail, "node_id_list", None)) else None
         if nid is None:
-            return False, None
+            return False, None, 0.0
         node = tasker.get_node_detail(nid)
         rec = getattr(node, "recognition", None)
         if not bool(getattr(rec, "hit", False)):
-            return False, None
+            return False, None, 0.0
+        score = getattr(rec, "score", None)
+        try:
+            score = float(score) if score is not None else 1.0
+        except (TypeError, ValueError):
+            score = 1.0
         box = getattr(rec, "box", None)
         if box is None:
-            return True, None
-        return True, (int(box.x + box.w // 2), int(box.y + box.h // 2))
+            return True, None, score
+        return True, (int(box.x + box.w // 2), int(box.y + box.h // 2)), score
     except Exception as exc:  # noqa: BLE001 - 匹配异常按未命中
         log(f"MV 模板 {tpl} 匹配异常（按未命中）: {exc}", "WARN")
-        return False, None
+        return False, None, 0.0
+
+
+def _mv_match_multi(tasker, frame, tpls, thrs, rois):
+    """★#60★ 多模板任一命中（box 取最高分者），与 in_game_marker 数组机制同风格。
+
+    tpls/thrs/rois 等长数组（缺项回退末项/0.75/None）；全部未命中返回 (False, None, 0.0, "")。
+    ★#61 P2-2★ 返回第 4 元 = 实际命中模板名（供 re_click WARN 输出真实命中者）。"""
+    best = (False, None, 0.0, "")
+    for i, t in enumerate(tpls):
+        thr = thrs[i] if i < len(thrs) else (thrs[-1] if thrs else 0.75)
+        roi = rois[i] if i < len(rois) and rois[i] else (rois[-1] if rois else None)
+        hit, center, score = _mv_match(tasker, frame, t, thr, roi)
+        if hit and score >= best[2]:
+            best = (True, center, score, t)
+    return best
 
 
 def run_mv_flow(cfg: dict, *, ctrl, tasker, hwnd, marker_hit_fn, monitor,
@@ -1658,6 +1729,18 @@ def run_play_flow(cfg: dict, *, ctrl, tasker, hwnd, marker_hit_fn, monitor,
         log_fn=log_fn, sleep_fn=sleep_fn, now_fn=now_fn, save_fn=save_fn)
 
 
+_CONFIRM_FALLBACK_WARNED: set = set()
+
+
+def _warn_confirm_fallback_once(tpl: str, log_fn=log) -> None:
+    """★#56★ confirm 模板无显式 roi 时一次性 WARN（模块级去重，避免刷屏）。"""
+    if tpl in _CONFIRM_FALLBACK_WARNED:
+        return
+    _CONFIRM_FALLBACK_WARNED.add(tpl)
+    log_fn(f"confirm 模板 {tpl} 无显式 roi 条目，使用全图匹配（建议在 flow 配置 "
+           f"confirm_params 中显式化）", "WARN")
+
+
 def _run_flow_generic(cfg: dict, *, ctrl, tasker, hwnd, marker_hit_fn, monitor,
                       flowcfg, label: str, short: str, tag_prefix: str,
                       log_fn=log, sleep_fn=time.sleep, now_fn=time.monotonic,
@@ -1683,6 +1766,8 @@ def _run_flow_generic(cfg: dict, *, ctrl, tasker, hwnd, marker_hit_fn, monitor,
     retry = int(mvcfg.get("step_retry", 2))
     home_to = float(mvcfg.get("return_home_confirm_sec", 20))
     interval = 0.9
+    # ★#56 B1★ 流程启动前稳定延迟（主界面淡入动画期间点击易被吞，56 实测两轮同型失败）
+    start_delay = float(mvcfg.get("start_delay_sec", 3.0))
     # ★#51★ 确认等待中的弹窗检查钩子配置（放弃中断Live确认 → 自动点「放 弃」）
     dialog_check = bool(mvcfg.get("dialog_check", False))
     dialogs = list(mvcfg.get("dialogs") or [])
@@ -1699,6 +1784,10 @@ def _run_flow_generic(cfg: dict, *, ctrl, tasker, hwnd, marker_hit_fn, monitor,
         if t2:
             tpl_params[t2] = ((s2.get("threshold") or [0.75])[0],
                               (s2.get("roi") or [None])[0])
+    # ★#56 B3★ flow 级 confirm_params：为不在 steps 里的 confirm 模板补显式 threshold/roi
+    for ct2, cp2 in (mvcfg.get("confirm_params") or {}).items():
+        tpl_params[ct2] = ((cp2.get("threshold") or [0.75])[0],
+                           (cp2.get("roi") or [None])[0])
 
     rec = cfg.get("recognition", {})
     lf_cfg = rec.get("loading_frame", {})
@@ -1741,7 +1830,7 @@ def _run_flow_generic(cfg: dict, *, ctrl, tasker, hwnd, marker_hit_fn, monitor,
                 continue
             thr = (dlg.get("threshold") or [0.75])[0]
             roi = (dlg.get("roi") or [None])[0]
-            hit, _ = _mv_match(tasker, f2, t, thr, roi)
+            hit, _, _scd = _mv_match(tasker, f2, t, thr, roi)
             if not hit:
                 continue
             did = str(dlg.get("id", "dialog"))
@@ -1761,7 +1850,7 @@ def _run_flow_generic(cfg: dict, *, ctrl, tasker, hwnd, marker_hit_fn, monitor,
             f3 = _snap()
             chit, center = False, None
             if f3 is not None and getattr(f3, "size", 0) != 0:
-                chit, center = _mv_match(tasker, f3, ct, cthr, croi)
+                chit, center, _scd = _mv_match(tasker, f3, ct, cthr, croi)
             if chit and center:
                 dialog_click_count[did] = n + 1
                 try:
@@ -1786,7 +1875,7 @@ def _run_flow_generic(cfg: dict, *, ctrl, tasker, hwnd, marker_hit_fn, monitor,
         pthr = (pc.get("threshold") or [0.75])[0]
         proi = (pc.get("roi") or [None])[0]
         if frame is not None and getattr(frame, "size", 0) != 0:
-            hit, _ = _mv_match(tasker, frame, pt, pthr, proi)
+            hit, _, _scd = _mv_match(tasker, frame, pt, pthr, proi)
             if hit:
                 return True, f"{pt} already checked"
         coord = pc.get("coord")
@@ -1810,21 +1899,60 @@ def _run_flow_generic(cfg: dict, *, ctrl, tasker, hwnd, marker_hit_fn, monitor,
         f3 = _snap()
         if f3 is None or getattr(f3, "size", 0) == 0:
             return False, "precheck re-verify screencap invalid"
-        hit2, _ = _mv_match(tasker, f3, pt, pthr, proi)
+        hit2, _, _scd = _mv_match(tasker, f3, pt, pthr, proi)
         if hit2:
             return True, f"{pt} checked after click"
         return False, f"{pt} unchecked after click"
 
-    def _confirm(confirm, tpl, thr, roi):
-        """点击后的正向确认。返回 (ok, why)。★#51★ 每次采样先做弹窗检查钩子。"""
+    def _maybe_re_click(f2, tpls, thrs, rois, sid, re_click, state):
+        """★#56 B2★ 确认轮询中的二次点击：页面未切换（主模板仍命中）→ 按间隔重击主按钮。
+
+        re_click 配置 = {"interval_sec": .., "max_clicks": ..}；页面已切换（主模板不再命中）
+        → 停止；达 max_clicks 上限 → 停止。每次重击 WARN 计次。"""
+        if not re_click or state["count"] >= int(re_click.get("max_clicks", 2)):
+            return
+        if now_fn() - state["last"] < float(re_click.get("interval_sec", 5)):
+            return
+        hit3, c3, sc3, hit_tpl = _mv_match_multi(tasker, f2, tpls, thrs, rois)
+        if not hit3 or c3 is None:
+            return                     # 页面已切换 → 停止重击
+        try:
+            job = ctrl.post_click(int(c3[0]), int(c3[1]))
+            job.wait()
+            state["count"] += 1
+            state["last"] = now_fn()
+            lf(f"{short} 步骤 {sid}：确认窗口内页面未切换（实际命中 {hit_tpl} "
+               f"score={sc3:.3f}），re_click 第 {state['count']}/"
+               f"{int(re_click.get('max_clicks', 2))} 次 ({c3[0]},{c3[1]})", "WARN")
+        except Exception as exc:  # noqa: BLE001
+            lf(f"{label} re_click 点击异常: {exc}", "WARN")
+
+    def _keep_last(out, f2):
+        """★#68 F4★ 仅在拿到**有效帧**时更新「最后采样帧」。
+
+        末次截图失败（None）/空帧不得覆盖上一个有效帧 —— 否则失败留图会回退到 attempt
+        起始帧，正是 #62 要消灭的取证失真。
+        """
+        if out is not None and f2 is not None and getattr(f2, "size", 0) != 0:
+            out["last_frame"] = f2
+
+    def _confirm(confirm, tpls, thrs, rois, sid="", re_click=None, out=None):
+        """点击后的正向确认。返回 (ok, why)。★#51★ 每次采样先做弹窗检查钩子；
+        ★#56 B2★ re_click 配置存在时按间隔重击主按钮（页面未切换才击）。
+        ★#61 P2-1★ out 为可变容器（dict）：轮询期间持续更新 out["last_frame"]=
+        最后采样帧（内存引用，勿频繁写盘）；确认失败时调用方用「最后采样帧」留图
+        （最接近失败时刻的画面），轮询一次都没执行过（极端）才回退 attempt 起始帧。"""
+        re_state = {"count": 0, "last": now_fn()}
         if confirm == "home":
             end = now_fn() + home_to
             while now_fn() < end:
                 f2 = _snap()
+                _keep_last(out, f2)               # ★#61/#68★ 最后有效采样帧
                 if f2 is not None and getattr(f2, "size", 0) != 0:
                     if _check_dialog(f2):
                         sleep_fn(interval)
                         continue
+                    _maybe_re_click(f2, tpls, thrs, rois, sid, re_click, re_state)
                     if not _loading(f2) and marker_hit_fn and marker_hit_fn(f2):
                         save_fn(f2, f"{tag_prefix}_return_home")
                         return True, "home confirmed"
@@ -1835,32 +1963,42 @@ def _run_flow_generic(cfg: dict, *, ctrl, tasker, hwnd, marker_hit_fn, monitor,
             end = now_fn() + step_to
             while now_fn() < end:
                 f2 = _snap()
+                _keep_last(out, f2)               # ★#61/#68★ 最后有效采样帧
                 if f2 is None or getattr(f2, "size", 0) == 0:
                     sleep_fn(interval)
                     continue
                 if _check_dialog(f2):
                     sleep_fn(interval)
                     continue
-                hit2, _ = _mv_match(tasker, f2, tpl, thr, roi)
+                _maybe_re_click(f2, tpls, thrs, rois, sid, re_click, re_state)
+                hit2, _sc2, _sc3, _tpl4 = _mv_match_multi(tasker, f2, tpls, thrs, rois)
                 if not hit2:
                     return True, "target gone"
                 sleep_fn(interval)
             return False, f"{tpl} still visible after {step_to:.0f}s"
         # confirm 为模板名（下一步页面的按钮出现 = 已进入下一步）
+        if confirm not in tpl_params:
+            _warn_confirm_fallback_once(confirm, lf)   # ★#56 B3★ 无显式 roi → 一次性 WARN
         cthr, croi = tpl_params.get(confirm, (0.75, None))
         end = now_fn() + step_to
         while now_fn() < end:
             f2 = _snap()
+            _keep_last(out, f2)                   # ★#61/#68★ 最后有效采样帧
             if f2 is not None and getattr(f2, "size", 0) != 0:
                 if _check_dialog(f2):
                     sleep_fn(interval)
                     continue
-                hit2, _ = _mv_match(tasker, f2, confirm, cthr, croi)
+                _maybe_re_click(f2, tpls, thrs, rois, sid, re_click, re_state)
+                hit2, _scd, _sc2 = _mv_match(tasker, f2, confirm, cthr, croi)
                 if hit2:
                     return True, f"{confirm} appeared"
             sleep_fn(interval)
         return False, f"{confirm} not appeared within {step_to:.0f}s"
 
+    if start_delay > 0:
+        lf(f"{label}：流程启动前稳定等待 {start_delay:.1f}s"
+           f"（主界面淡入动画期间点击易被吞，56 实测 19:47/21:14 两轮同型失败）")
+        sleep_fn(start_delay)
     started = now_fn()
     lf("=" * 62)
     lf(f"【{label}】启动（登录已成功；流程失败按选项 B 上报 → exit 2）")
@@ -1886,12 +2024,14 @@ def _run_flow_generic(cfg: dict, *, ctrl, tasker, hwnd, marker_hit_fn, monitor,
                 return False, f"process_check_error@{sid}"
 
             click_kind = str(st.get("click", "box_center"))
-            tpl = (st.get("template") or [None])[0]
-            thr = (st.get("threshold") or [0.75])[0]
-            roi = (st.get("roi") or [None])[0]
+            tpl = (st.get("template") or [None])[0]          # 供日志头显示
+            tpls = [t for t in (st.get("template") or []) if t]   # ★#60★ 数组任一命中
+            thrs = [float(x) for x in (st.get("threshold") or [])] or [0.75]
+            rois = list(st.get("roi") or [])
             confirm = str(st.get("confirm", ""))
             coord = st.get("coord")
             post_wait = float(st.get("post_wait_sec", 0.0))
+            re_click_cfg = st.get("re_click_during_confirm")   # ★#56 B2★
 
             attempt = 0
             ok_step, why = False, ""
@@ -1927,10 +2067,15 @@ def _run_flow_generic(cfg: dict, *, ctrl, tasker, hwnd, marker_hit_fn, monitor,
                 if click_kind == "none":
                     # ★#54★ 纯确认步骤（不点击），如打歌第⑧步主界面二次确认
                     lf(f"{short} 步骤 {sid}：仅确认（不点击）")
-                    ok_step, why = _confirm(confirm, tpl, thr, roi)
+                    confirm_out = {"last_frame": None}   # ★#61 P2-1★
+                    ok_step, why = _confirm(confirm, tpls, thrs, rois, sid,
+                                            re_click_cfg, confirm_out)
                     if ok_step:
                         break
-                    save_fn(frame, f"{tag_prefix}_fail_{sid}")
+                    # ★#61 P2-1★ 失败留图用最后采样帧（最接近失败时刻）；轮询未执行才回退起始帧
+                    _lf = confirm_out.get("last_frame")
+                    save_fn(_lf if _lf is not None else frame,
+                            f"{tag_prefix}_fail_{sid}")
                     lf(f"{short} 步骤 {sid} 确认失败: {why}（已留图 {tag_prefix}_fail_{sid}）",
                        "WARN")
                     sleep_fn(interval)
@@ -1948,7 +2093,8 @@ def _run_flow_generic(cfg: dict, *, ctrl, tasker, hwnd, marker_hit_fn, monitor,
                         continue
                     cx, cy = int(coord[0]), int(coord[1])
                 else:
-                    hit, center = _mv_match(tasker, frame, tpl, thr, roi)
+                    hit, center, _score, _tpl_hit = _mv_match_multi(
+                        tasker, frame, tpls, thrs, rois)
                     if not hit or center is None:
                         lf(f"{short} 步骤 {sid}：{tpl} 未命中（等待/重试）")
                         ok_step, why = False, f"{tpl} not found"
@@ -1966,14 +2112,22 @@ def _run_flow_generic(cfg: dict, *, ctrl, tasker, hwnd, marker_hit_fn, monitor,
                     continue
                 lf(f"{short} 步骤 {sid}：点击 ({cx},{cy})（{click_kind}）")
 
-                ok_step, why = _confirm(confirm, tpl, thr, roi)
+                confirm_out = {"last_frame": None}       # ★#61 P2-1★
+                ok_step, why = _confirm(confirm, tpls, thrs, rois, sid,
+                                        re_click_cfg, confirm_out)
                 if ok_step:
                     if post_wait > 0:
                         lf(f"{short} 步骤 {sid}：确认成功，等待 {post_wait:.1f}s（载入/过渡）")
                         sleep_fn(post_wait)
                     break
-                save_fn(frame, f"{tag_prefix}_fail_{sid}")
-                lf(f"{short} 步骤 {sid} 确认失败: {why}（已留图 {tag_prefix}_fail_{sid}）", "WARN")
+                # ★#61 P2-1★ 失败留图用最后采样帧（最接近失败时刻的画面，如確認超时时的
+                # 升级变体布局页）；轮询一次都没执行过（极端）才回退 attempt 起始帧。
+                # 重试每一轮的失败留图仍逐轮保留（只新增不覆盖不变）。
+                _lf = confirm_out.get("last_frame")
+                save_fn(_lf if _lf is not None else frame,
+                        f"{tag_prefix}_fail_{sid}")
+                lf(f"{short} 步骤 {sid} 确认失败: {why}（已留图 {tag_prefix}_fail_{sid}）",
+                   "WARN")
                 sleep_fn(interval)
 
             if not ok_step:
@@ -2323,6 +2477,7 @@ def run(cfg: dict, skip_launch: bool = False) -> tuple[bool, str]:
             marker_hit_fn=marker_hit_fn,
             probe_fn=lambda f, tag: save_probe_frame(f, tag, log_fn=log),
             log_fn=log,
+            click_fn=lambda x, y: ctrl.post_click(x, y).wait(),
             loading_seen_before=bool(sink.loading_seen_after_click),
         )
         log(f"点击后判定结论: {verdict} | {why}")
@@ -3793,6 +3948,7 @@ def static_self_check(cfg: dict) -> bool:
         for t54, (w54, h54) in {
                 "play_decide_button.png": (195, 52), "play_skip_button.png": (115, 30),
                 "play_start_button.png": (205, 52), "play_ok_button.png": (200, 42),
+                "play_ok_button2.png": (208, 54),
                 "play_dialog_title.png": (258, 30), "play_result_title.png": (326, 29),
                 "play_max_checked.png": (60, 33)}.items():
             p54 = IMAGE_DIR / t54
@@ -3810,6 +3966,12 @@ def static_self_check(cfg: dict) -> bool:
                and steps54[6]["template"][0] == "mv_back_button.png", \
             "#54 两次返回须复用 mv_back_button"
         assert steps54[7].get("click") == "none", "#54 第⑧步须为纯确认步（click=none）"
+        # (b2) ★#60★ 第⑤步模板数组（結果页两页 OK 任一命中）
+        s560 = steps54[4]
+        assert s560["template"] == ["play_ok_button.png", "play_ok_button2.png"], \
+            "#60 第⑤步模板须为数组（結果页两页 OK 任一命中）"
+        assert len(s560["threshold"]) == 2 and len(s560["roi"]) == 2, \
+            "#60 第⑤步 threshold/roi 数组须与模板一一对应"
         pc54 = steps54[3].get("precheck")
         assert pc54 and pc54["template"][0] == "play_max_checked.png" \
                and pc54["coord"] and pc54.get("miss_tag") == "play_max_unchecked", \
@@ -3831,6 +3993,23 @@ def static_self_check(cfg: dict) -> bool:
         generic54 = src54[src54.index("def _run_flow_generic("):src54.index("def run(cfg: dict")]
         assert "precheck" in generic54 and "click_kind == \"none\"" in generic54, \
             "#54 通用执行器须支持 precheck 钩子与 click=none 纯确认步"
+        # (c2) ★#56★ 三项优化断言
+        assert float(cfg["flow"]["mv"]["start_delay_sec"]) > 0 \
+               and float(cfg["flow"]["play"]["start_delay_sec"]) > 0, \
+            "#56 start_delay_sec 须存在于 mv/play 两段（默认 3.0）"
+        rc56 = steps54[4].get("re_click_during_confirm")
+        assert rc56 and int(rc56["max_clicks"]) == 2 \
+               and float(rc56["interval_sec"]) > 0, \
+            "#56 第⑤步须启用 re_click_during_confirm（interval/max_clicks）"
+        assert set(cfg["flow"]["play"]["confirm_params"].keys()) == \
+               {"play_dialog_title.png", "play_result_title.png"}, \
+            "#56 confirm_params 须显式覆盖 play_dialog_title/play_result_title"
+        assert "start_delay" in generic54 and "_maybe_re_click" in generic54 \
+               and "_warn_confirm_fallback_once" in generic54 \
+               and "_CONFIRM_FALLBACK_WARNED" in src54, \
+            "#56 generic 须含 start_delay/re_click/fallback WARN 实现"
+        assert "_mv_match_multi" in generic54 and "_mv_match_multi(" in generic54 \
+               and "tasker, frame, tpls, thrs, rois" in generic54, "#60 通用执行器须用 _mv_match_multi（数组任一命中）"
 
         # (d) 三态不受影响：FAIL_PLAY_FLOW → exit 2；0/3/2 不变
         nop54 = lambda *a, **k: None  # noqa: E731
@@ -3896,6 +4075,143 @@ def static_self_check(cfg: dict) -> bool:
               "FAIL_PLAY_FLOW→exit 2 且三态 0/3/2 不变；mock 失败路径真调用安全返回")
     except Exception as exc:
         failures.append(f"#54 自动打歌流程检查失败: {exc}")
+
+    # 30) ★#64★ 登录确认阶段通用弹窗清除（popup_clear）：配置/门控/坐标界内/三态不变
+    try:
+        pc64 = cfg["flow"]["popup_clear"]
+        assert pc64["enabled"] is True, "#64 popup_clear.enabled 须默认 true（门控兜底在代码层）"
+        assert int(pc64["taps"]) == 4 and float(pc64["interval_sec"]) > 0 \
+               and float(pc64["min_wait_sec"]) > 0, "#64 taps/interval/min_wait 须有效"
+        cx64, cy64 = pc64["coord"]
+        assert 0 <= int(cx64) < 1280 and 0 <= int(cy64) < 720, \
+            "#64 popup coord 须在 1280x720 界内"
+        assert "連点" in pc64["note"] or "连点" in pc64["note"], \
+            "#64 note 须写明用户确认的连点关闭语义"
+        src64 = (BASE_DIR / "main.py").read_text(encoding="utf-8")
+        i_pcv = src64.index("def post_click_verify")
+        pcv64 = src64[i_pcv:src64.index("def direct_marker_confirm")]
+        # ★#68 F3★ 门控改「行为级」断言（原为源码字面量检查，恒真、不构成证据）。
+        # 澄清后的语义：生产有效门控 = enabled ∧ (mv∨play)；click_fn 未注入时额外禁用
+        # （run() 无条件注入，故该条只在 --check/离线等不注入路径生效，属第三重防御）。
+        import numpy as np
+        _fr64 = np.random.RandomState(64).randint(60, 200, size=(720, 1280, 3)).astype(
+            np.uint8)
+        _clock64 = [0.0]
+
+        def _now64():
+            _clock64[0] += 1.0
+            return _clock64[0]
+
+        def _sleep64(s):
+            _clock64[0] += float(s)
+
+        def _clicks64(c64, click_fn):
+            got = []
+            post_click_verify(
+                c64, screencap_fn=lambda: _fr64, is_alive_fn=lambda: True,
+                button_visible_fn=lambda f: False, marker_hit_fn=lambda f: False,
+                click_fn=(None if click_fn is None else (lambda x, y: got.append((x, y)))),
+                log_fn=lambda *a, **k: None, now_fn=_now64, sleep_fn=_sleep64)
+            return got
+
+        _cfg_on64 = json.loads(json.dumps(cfg))
+        _cfg_on64["flow"]["mv_enabled"] = True
+        _cfg_on64["flow"]["popup_clear"]["min_wait_sec"] = 1.0
+        _cfg_off64 = json.loads(json.dumps(cfg))        # mv/play 全关
+        assert len(_clicks64(_cfg_on64, None)) == 0, \
+            "#68 F3 click_fn 未注入时必须零点击（离线/--check 第三重防御）"
+        assert len(_clicks64(_cfg_off64, "inject")) == 0, \
+            "#68 F3 mv/play 全关时必须零点击（有效门控两条件之一）"
+        assert len(_clicks64(_cfg_on64, "inject")) == int(pc64["taps"]), \
+            "#68 F3 mv 开启 + click_fn 注入须正常连点到 taps 上限（对照组）"
+        assert "popup_tap_" in pcv64 and "popup_min_wait" in pcv64 \
+               and "popup_taps" in pcv64, "#64 弹窗清除子阶段须存在"
+        # 普通登录零回归：popup 子阶段必须在 marker 正向判定之后（marker 命中即 return，
+        # 弹窗清除绝不先于三态判定执行）
+        i_marker64 = pcv64.index('return "MARKER"')
+        i_popup64 = pcv64.index("popup_enabled and taps_used < popup_taps")
+        assert i_marker64 < i_popup64, "#64 popup_clear 须在 marker 正向判定之后"
+        run_body64 = src64[src64.index("def run(cfg: dict"):src64.index("def static_self_check")]
+        assert "click_fn=lambda x, y: ctrl.post_click(x, y).wait()" in run_body64, \
+            "#64 run() 调用点须注入 click_fn（普通登录不注入则门控自动关闭）"
+        # 三态不受影响
+        nop64 = lambda *a, **k: None  # noqa: E731
+        assert report_result(OK_MARKER, log_fn=nop64) == 0 \
+               and report_result(OK_DEGRADED_UNVERIFIED, log_fn=nop64) == 3 \
+               and report_result(FAIL_NOT_CONFIRMED, log_fn=nop64) == 2, \
+            "#64 三态 0/3/2 不受影响"
+        print("[30] ★#64/#68 popup_clear OK★: 配置结构完整（taps=4/interval/coord=[640,360] 界内/"
+              "min_wait=8）、门控行为级验证（mv 开+click_fn 注入→连点至 taps 上限；"
+              "mv/play 全关→零点击；click_fn 未注入→零点击）、"
+              "子阶段在 marker 正向判定之后（弹窗清除绝不先于三态判定）、"
+              "run() 调用点无条件注入 click_fn（有效门控=enabled∧(mv∨play)）、三态 0/3/2 不受影响；"
+              "★#68 F1★ 点击后重置 absent 计时基准（loading_seen_before=True 下仍能连点满 taps）；"
+              "note 写明用户确认的连点关闭语义与坐标风险评估")
+    except Exception as exc:
+        failures.append(f"#64 popup_clear 检查失败: {exc}")
+
+    # 31) ★#66★ 采集上限命令行覆盖：开关存在 / 仅内存不落盘 / 不带开关默认不变 / 边界校验
+    try:
+        src66 = (BASE_DIR / "main.py").read_text(encoding="utf-8")
+        main66 = src66[src66.index("\ndef main(argv=None) -> int:") + 1:]
+        assert 'add_argument("--explore-max-duration"' in main66, \
+            "#66 须有 --explore-max-duration 命令行开关"
+        assert 'add_argument("--explore-max-frames"' in main66, \
+            "#66 须有 --explore-max-frames 命令行开关"
+        # 位置：覆盖调用必须在 if args.check 之后（--check 仍用原始配置，[26]/[31] 不受影响）
+        i_chk66 = main66.index("if args.check:")
+        i_ovr66 = main66.index("_apply_explore_overrides(")
+        assert i_chk66 < i_ovr66, \
+            "#66 覆盖须放在 if args.check 之后（--check 路径不受影响）"
+        # 仅内存：main() 的覆盖段绝不出现任何写盘原语
+        seg66 = main66[i_ovr66:]
+        assert not any(k in seg66 for k in
+                       ("write_text", "json.dump", "open(", "CONFIG_FILE")), \
+            "#66 覆盖仅内存，绝不写盘"
+        # 不带开关：落盘默认值逐字不变
+        ec_disk66 = load_settings()["flow"]["mv_explore_cfg"]
+        assert float(ec_disk66["max_duration_sec"]) == 180.0 \
+               and int(ec_disk66["max_frames"]) == 200, \
+            "#66 settings.json 落盘默认须仍为 max_duration_sec=180 / max_frames=200"
+
+        # 真调用纯函数：覆盖生效 + 落盘字节不变
+        b_before66 = CONFIG_FILE.read_bytes()
+        c66 = load_settings()
+        _apply_explore_overrides(c66, max_duration=600, max_frames=1500)
+        assert float(c66["flow"]["mv_explore_cfg"]["max_duration_sec"]) == 600.0 \
+               and int(c66["flow"]["mv_explore_cfg"]["max_frames"]) == 1500, \
+            "#66 覆盖须真实写入内存配置"
+        # 单开一项不影响另一项
+        c66b = load_settings()
+        _apply_explore_overrides(c66b, max_frames=1200)
+        assert float(c66b["flow"]["mv_explore_cfg"]["max_duration_sec"]) == \
+               float(ec_disk66["max_duration_sec"]), "#66 只给 --explore-max-frames 时不得动时长"
+        assert CONFIG_FILE.read_bytes() == b_before66, \
+            "#66 覆盖绝不写盘（settings.json 字节须不变）"
+        # 边界校验：0 / 负数 / NaN / inf 与 frames<1 必须抛 ValueError
+        for bad in (0, 0.0, -1, -0.5, float("nan"), float("inf")):
+            try:
+                _apply_explore_overrides(load_settings(), max_duration=bad)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"#66 max_duration={bad!r} 须被拒绝")
+        for bad in (0, -1, -200):
+            try:
+                _apply_explore_overrides(load_settings(), max_frames=bad)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"#66 max_frames={bad!r} 须被拒绝")
+        assert "ap.error(str(exc))" in main66, \
+            "#66 非法值须经 ap.error 报错（exit 2），不得带着非法上限继续跑"
+        print("[31] ★#66 采集上限命令行覆盖 OK★: --explore-max-duration/--explore-max-frames "
+              "存在且位于 if args.check 之后；仅内存覆盖 flow.mv_explore_cfg、"
+              "settings.json 字节不变（默认 180/200 不变）；单开一项不动另一项；"
+              "duration<=0/NaN/inf、frames<1 一律 ValueError → ap.error exit 2；"
+              "三态 0/3/2 与 mv_explore_loop 采样逻辑未改")
+    except Exception as exc:
+        failures.append(f"#66 采集上限命令行覆盖检查失败: {exc}")
 
     print("-" * 70)
     if failures:
@@ -4037,6 +4353,38 @@ def write_result_files(cfg: dict, *, ok: bool, reason: str, exit_code: int,
     return result
 
 
+def _apply_explore_overrides(cfg: dict, *, max_duration=None, max_frames=None) -> dict:
+    """★#66★ 采集模式上限的命令行覆盖（仅内存，绝不写盘）。
+
+    max_duration：秒，须 0 < v < inf；max_frames：张，须 >= 1 的整数。
+    None 表示不覆盖 → settings.json 的落盘默认值逐字生效。
+    非法值抛 ValueError，由 main() 转 argparse 报错并以 exit 2 退出。
+    原地修改并返回 cfg，便于单测直接断言生效值。
+    """
+    if max_duration is None and max_frames is None:
+        return cfg
+    ec = cfg.setdefault("flow", {}).setdefault("mv_explore_cfg", {})
+    if max_duration is not None:
+        try:
+            dur = float(max_duration)
+        except (TypeError, ValueError):
+            raise ValueError(f"--explore-max-duration 须为数字，当前 {max_duration!r}")
+        # NaN 与任何值比较均为 False、inf 会让时长上限形同不存在 → 一并拒绝
+        if not (0.0 < dur < float("inf")):
+            raise ValueError(
+                f"--explore-max-duration 须为大于 0 的有限秒数，当前 {max_duration!r}")
+        ec["max_duration_sec"] = dur
+    if max_frames is not None:
+        try:
+            frames = int(max_frames)
+        except (TypeError, ValueError):
+            raise ValueError(f"--explore-max-frames 须为整数，当前 {max_frames!r}")
+        if frames < 1:
+            raise ValueError(f"--explore-max-frames 须 >= 1，当前 {max_frames!r}")
+        ec["max_frames"] = frames
+    return cfg
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="SongForPrism 自动登录")
     ap.add_argument("--check", action="store_true", help="静态自测后退出（不启动游戏）")
@@ -4047,6 +4395,10 @@ def main(argv=None) -> int:
                     help="登录成功后自动观看 MV（仅内存覆盖 mv_enabled=true，不落盘）")
     ap.add_argument("--play-enabled", action="store_true",
                     help="登录成功后自动打歌（跳过模式）（仅内存覆盖 play_enabled=true，不落盘）")
+    ap.add_argument("--explore-max-duration", type=float, default=None, metavar="SEC",
+                    help="覆盖采集模式最长时长秒数（仅内存覆盖 mv_explore_cfg.max_duration_sec，不落盘）")
+    ap.add_argument("--explore-max-frames", type=int, default=None, metavar="N",
+                    help="覆盖采集模式最大留图数（仅内存覆盖 mv_explore_cfg.max_frames，不落盘）")
     args = ap.parse_args(argv)
 
     cfg = load_settings()
@@ -4063,6 +4415,14 @@ def main(argv=None) -> int:
     # ★#54★ 同上：--play-enabled 仅内存覆盖 flow.play_enabled，绝不写盘。
     if args.play_enabled:
         cfg["flow"]["play_enabled"] = True
+    # ★#66★ 同上：--explore-max-duration/--explore-max-frames 仅内存覆盖
+    # flow.mv_explore_cfg.{max_duration_sec,max_frames}，绝不写盘；非法值 ap.error → exit 2。
+    if args.explore_max_duration is not None or args.explore_max_frames is not None:
+        try:
+            _apply_explore_overrides(cfg, max_duration=args.explore_max_duration,
+                                     max_frames=args.explore_max_frames)
+        except ValueError as exc:
+            ap.error(str(exc))          # 打印用法 + exit 2，绝不带着非法上限继续跑
 
     t0_48 = time.monotonic()
     _ok, reason = run(cfg, skip_launch=args.skip_launch)
